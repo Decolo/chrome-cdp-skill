@@ -19,6 +19,9 @@ const NAVIGATION_TIMEOUT = 30000;
 const DAEMON_CONNECT_RETRIES = 20;
 const DAEMON_CONNECT_DELAY = 300;
 const MIN_TARGET_PREFIX_LEN = 8;
+const COMMAND_HISTORY_LIMIT = 50;
+const HTML_OUTPUT_LIMIT = 20000;
+const NET_ENTRY_LIMIT = 40;
 const IS_WINDOWS = process.platform === 'win32';
 if (!IS_WINDOWS) process.umask(0o077);
 const RUNTIME_DIR = IS_WINDOWS
@@ -219,6 +222,26 @@ function formatPageList(pages) {
   }).join('\n');
 }
 
+function formatDuration(ms) {
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  return `${Math.round(ms / 100) / 10}s`;
+}
+
+function formatUptime(ms) {
+  const totalSeconds = Math.floor(ms / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) return `${hours}h ${minutes}m ${seconds}s`;
+  if (minutes > 0) return `${minutes}m ${seconds}s`;
+  return `${seconds}s`;
+}
+
+function truncateText(text, maxLen) {
+  if (!text || text.length <= maxLen) return text;
+  return `${text.slice(0, maxLen)}\n\n... [truncated ${text.length - maxLen} chars]`;
+}
+
 function shouldShowAxNode(node, compact = false) {
   const role = node.role?.value || '';
   const name = node.name?.value ?? '';
@@ -336,10 +359,167 @@ async function shotStr(cdp, sid, filePath, targetId) {
 }
 
 async function htmlStr(cdp, sid, selector) {
-  const expr = selector
-    ? `document.querySelector(${JSON.stringify(selector)})?.outerHTML || 'Element not found'`
-    : `document.documentElement.outerHTML`;
-  return evalStr(cdp, sid, expr);
+  const expr = `
+    (function() {
+      const selector = ${JSON.stringify(selector || '')};
+      const root = selector ? document.querySelector(selector) : document.documentElement;
+      if (!root) return { ok: false, error: 'Element not found: ' + selector };
+      const html = root.outerHTML || '';
+      return {
+        ok: true,
+        selector: selector || 'document.documentElement',
+        html,
+        truncated: html.length > ${HTML_OUTPUT_LIMIT},
+        totalLength: html.length,
+      };
+    })()
+  `;
+  const raw = await evalStr(cdp, sid, expr);
+  const data = JSON.parse(raw);
+  if (!data.ok) throw new Error(data.error);
+  const html = truncateText(data.html, HTML_OUTPUT_LIMIT);
+  if (!data.truncated) return html;
+  return [
+    `HTML scope: ${data.selector}`,
+    `HTML length: ${data.totalLength} chars`,
+    html,
+  ].join('\n');
+}
+
+function formatElementSummary(item) {
+  const parts = [`<${item.tag.toLowerCase()}>`];
+  if (item.label) parts.push(JSON.stringify(item.label));
+  if (item.type) parts.push(`type=${item.type}`);
+  if (item.name) parts.push(`name=${item.name}`);
+  if (item.placeholder) parts.push(`placeholder=${JSON.stringify(item.placeholder)}`);
+  if (item.href) parts.push(`href=${item.href}`);
+  return parts.join(' ');
+}
+
+async function inspectStr(cdp, sid, selector) {
+  const expr = `
+    (function() {
+      const selector = ${JSON.stringify(selector || '')};
+      const root = selector ? document.querySelector(selector) : document.body;
+      if (!root) return { ok: false, error: 'Element not found: ' + selector };
+
+      const MAX_TEXT = 700;
+      const MAX_ITEMS = 20;
+      const textOf = (el, max = 90) => (el.innerText || el.textContent || '')
+        .replace(/\\s+/g, ' ')
+        .trim()
+        .slice(0, max);
+      const attr = (el, name) => el.getAttribute(name) || '';
+      const labelFor = (el) => {
+        const aria = attr(el, 'aria-label');
+        if (aria) return aria.trim();
+        const labelledBy = attr(el, 'aria-labelledby');
+        if (labelledBy) {
+          const text = labelledBy.split(/\\s+/).map(id => document.getElementById(id)?.innerText || '').join(' ').trim();
+          if (text) return text.slice(0, 90);
+        }
+        if (el.id) {
+          const label = document.querySelector('label[for="' + CSS.escape(el.id) + '"]');
+          if (label) return textOf(label);
+        }
+        return textOf(el);
+      };
+      const isVisible = (el) => {
+        if (!el || !(el instanceof Element)) return false;
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return rect.width > 0 && rect.height > 0 &&
+          style.visibility !== 'hidden' &&
+          style.display !== 'none' &&
+          Number(style.opacity || '1') > 0;
+      };
+      const summarize = (el) => {
+        const rect = el.getBoundingClientRect();
+        return {
+          tag: el.tagName,
+          label: labelFor(el),
+          type: attr(el, 'type'),
+          name: attr(el, 'name'),
+          placeholder: attr(el, 'placeholder'),
+          href: attr(el, 'href'),
+          id: attr(el, 'id'),
+          classes: attr(el, 'class').split(/\\s+/).filter(Boolean).slice(0, 4).join('.'),
+          disabled: !!el.disabled || attr(el, 'aria-disabled') === 'true',
+          rect: {
+            x: Math.round(rect.x),
+            y: Math.round(rect.y),
+            w: Math.round(rect.width),
+            h: Math.round(rect.height),
+          },
+        };
+      };
+      const takeVisible = (query) => [
+          ...(root.matches?.(query) ? [root] : []),
+          ...Array.from(root.querySelectorAll(query)),
+        ]
+        .filter((el, idx, list) => list.indexOf(el) === idx)
+        .filter(isVisible)
+        .slice(0, MAX_ITEMS)
+        .map(summarize);
+      const active = document.activeElement && document.activeElement !== document.body
+        ? summarize(document.activeElement)
+        : null;
+
+      return {
+        ok: true,
+        scopedTo: selector || 'document.body',
+        title: document.title,
+        url: location.href,
+        readyState: document.readyState,
+        active,
+        headings: takeVisible('h1,h2,h3'),
+        buttons: takeVisible('button,[role="button"],input[type="button"],input[type="submit"]'),
+        links: takeVisible('a[href]'),
+        inputs: takeVisible('input:not([type="button"]):not([type="submit"]),textarea,select'),
+        forms: takeVisible('form'),
+        text: textOf(root, MAX_TEXT),
+        counts: {
+          buttons: root.querySelectorAll('button,[role="button"],input[type="button"],input[type="submit"]').length,
+          links: root.querySelectorAll('a[href]').length,
+          inputs: root.querySelectorAll('input:not([type="button"]):not([type="submit"]),textarea,select').length,
+          forms: root.querySelectorAll('form').length,
+        },
+      };
+    })()
+  `;
+  const raw = await evalStr(cdp, sid, expr);
+  const data = JSON.parse(raw);
+  if (!data.ok) throw new Error(data.error);
+
+  const lines = [
+    `Title: ${data.title || '(untitled)'}`,
+    `URL: ${data.url}`,
+    `Ready state: ${data.readyState}`,
+    `Scope: ${data.scopedTo}`,
+  ];
+  if (data.active) lines.push(`Focused: ${formatElementSummary(data.active)}`);
+
+  const addSection = (label, items, total) => {
+    lines.push('');
+    lines.push(`${label} (${items.length}${total > items.length ? ` of ${total}` : ''})`);
+    if (items.length === 0) {
+      lines.push('  (none visible)');
+      return;
+    }
+    for (const item of items) lines.push(`  - ${formatElementSummary(item)}`);
+  };
+
+  addSection('Headings', data.headings, data.headings.length);
+  addSection('Buttons', data.buttons, data.counts.buttons);
+  addSection('Links', data.links, data.counts.links);
+  addSection('Inputs', data.inputs, data.counts.inputs);
+  addSection('Forms', data.forms, data.counts.forms);
+  if (data.text) {
+    lines.push('');
+    lines.push('Text sample');
+    lines.push(data.text);
+  }
+  return lines.join('\n');
 }
 
 async function waitForDocumentReady(cdp, sid, timeoutMs = NAVIGATION_TIMEOUT) {
@@ -392,13 +572,29 @@ async function navStr(cdp, sid, url) {
 }
 
 async function netStr(cdp, sid) {
-  const raw = await evalStr(cdp, sid, `JSON.stringify(performance.getEntriesByType('resource').map(e => ({
-    name: e.name.substring(0, 120), type: e.initiatorType,
-    duration: Math.round(e.duration), size: e.transferSize
-  })))`);
-  return JSON.parse(raw).map(e =>
+  const raw = await evalStr(cdp, sid, `JSON.stringify((() => {
+    const entries = performance.getEntriesByType('resource')
+      .map(e => ({
+        name: e.name.substring(0, 120),
+        type: e.initiatorType || 'other',
+        duration: Math.round(e.duration),
+        size: e.transferSize || 0
+      }))
+      .sort((a, b) => b.duration - a.duration);
+    return {
+      total: entries.length,
+      entries: entries.slice(0, ${NET_ENTRY_LIMIT})
+    };
+  })())`);
+  const data = JSON.parse(raw);
+  const lines = data.entries.map(e =>
     `${String(e.duration).padStart(5)}ms  ${String(e.size || '?').padStart(8)}B  ${e.type.padEnd(8)}  ${e.name}`
-  ).join('\n');
+  );
+  if (data.total > data.entries.length) {
+    lines.unshift(`Showing slowest ${data.entries.length} of ${data.total} resource entries`);
+    lines.unshift('');
+  }
+  return lines.join('\n').trim();
 }
 
 // Click element by CSS selector
@@ -496,6 +692,51 @@ async function runBrowserDaemon() {
   // sessions: targetId → sessionId
   // Populated via Target.attachedToTarget events (from setAutoAttach) + fallback attachToTarget
   const sessions = new Map();
+  const startedAt = Date.now();
+  const commandHistory = [];
+
+  function recordCommand(entry) {
+    commandHistory.push(entry);
+    if (commandHistory.length > COMMAND_HISTORY_LIMIT) commandHistory.shift();
+  }
+
+  async function statsStr() {
+    const pages = await getPages(cdp).catch(() => []);
+    const slowest = [...commandHistory]
+      .sort((a, b) => b.durationMs - a.durationMs)
+      .slice(0, 5);
+    const recent = commandHistory.slice(-10);
+    const lastError = [...commandHistory].reverse().find(entry => !entry.ok);
+    const lines = [
+      `Browser daemon PID: ${process.pid}`,
+      `Uptime: ${formatUptime(Date.now() - startedAt)}`,
+      `Runtime dir: ${RUNTIME_DIR}`,
+      `Socket: ${BROWSER_SOCK}`,
+      `Sessions: ${sessions.size}`,
+      `Pages: ${pages.length}`,
+      `Recent commands: ${commandHistory.length}/${COMMAND_HISTORY_LIMIT}`,
+      `Last error: ${lastError ? `${lastError.cmd}${lastError.targetId ? ` target=${lastError.targetId.slice(0, 8)}` : ''}: ${lastError.error}` : '(none)'}`,
+    ];
+
+    const renderEntry = (entry) => {
+      const target = entry.targetId ? ` target=${entry.targetId.slice(0, 8)}` : '';
+      const status = entry.ok ? 'ok' : 'error';
+      const error = entry.error ? ` (${entry.error})` : '';
+      const size = entry.resultBytes != null ? ` ${entry.resultBytes}B` : '';
+      return `  - ${entry.cmd}${target}: ${formatDuration(entry.durationMs)}${size} ${status}${error}`;
+    };
+
+    lines.push('');
+    lines.push('Slowest recent commands');
+    if (slowest.length === 0) lines.push('  (none yet)');
+    else for (const entry of slowest) lines.push(renderEntry(entry));
+
+    lines.push('');
+    lines.push('Last commands');
+    if (recent.length === 0) lines.push('  (none yet)');
+    else for (const entry of recent) lines.push(renderEntry(entry));
+    return lines.join('\n');
+  }
 
   // Shutdown helpers
   let alive = true;
@@ -575,7 +816,7 @@ async function runBrowserDaemon() {
   }
 
   // Handle a command; targetId is required for tab-specific commands
-  async function handleCommand({ cmd, targetId, args }) {
+  async function runCommand({ cmd, targetId, args }) {
     try {
       let result;
       switch (cmd) {
@@ -587,6 +828,10 @@ async function runBrowserDaemon() {
         case 'list_raw': {
           const pages = await getPages(cdp);
           result = JSON.stringify(pages);
+          break;
+        }
+        case 'stats': {
+          result = await statsStr();
           break;
         }
         case 'open': {
@@ -612,6 +857,7 @@ async function runBrowserDaemon() {
           const run = async (sessionId) => {
             switch (cmd) {
               case 'snap': case 'snapshot': return snapshotStr(cdp, sessionId, true);
+              case 'inspect': return inspectStr(cdp, sessionId, args[0]);
               case 'eval': return evalStr(cdp, sessionId, args[0]);
               case 'shot': case 'screenshot': return shotStr(cdp, sessionId, args[0], targetId);
               case 'html': return htmlStr(cdp, sessionId, args[0]);
@@ -644,6 +890,22 @@ async function runBrowserDaemon() {
     } catch (e) {
       return { ok: false, error: e.message };
     }
+  }
+
+  async function handleCommand(req) {
+    const started = Date.now();
+    const res = await runCommand(req);
+    if (req.cmd !== 'list_raw') {
+      recordCommand({
+        cmd: req.cmd,
+        targetId: req.targetId,
+        durationMs: Date.now() - started,
+        resultBytes: Buffer.byteLength(String(res.result || ''), 'utf8'),
+        ok: !!res.ok,
+        error: res.ok ? '' : String(res.error || '').slice(0, 120),
+      });
+    }
+    return res;
   }
 
   // Unix socket server — NDJSON protocol
@@ -783,6 +1045,14 @@ async function stopDaemon() {
   }
 }
 
+async function refreshPagesCache() {
+  const conn = await getOrStartBrowserDaemon();
+  const raw = await sendCommand(conn, { cmd: 'list_raw', args: [] });
+  if (!raw.ok) throw new Error(raw.error || 'Failed to refresh page list');
+  writeFileSync(PAGES_CACHE, raw.result, { mode: 0o600 });
+  return JSON.parse(raw.result);
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -792,12 +1062,14 @@ const USAGE = `cdp - lightweight Chrome DevTools Protocol CLI (no Puppeteer)
 Usage: cdp <command> [args]
 
   list                              List open pages (shows unique target prefixes)
+  stats                             Show browser daemon health and recent command timings
+  inspect <target> [selector]       Lightweight page summary (optionally scoped to CSS selector)
   snap  <target>                    Accessibility tree snapshot
   eval  <target> <expr>             Evaluate JS expression
   shot  <target> [file]             Screenshot (default: screenshot-<target>.png in runtime dir); prints coordinate mapping
-  html  <target> [selector]         Get HTML (full page or CSS selector)
+  html  <target> [selector]         Get HTML (scoped when selector is provided; truncates large output)
   nav   <target> <url>              Navigate to URL and wait for load completion
-  net   <target>                    Network performance entries
+  net   <target>                    Slowest network performance entries
   click   <target> <selector>       Click an element by CSS selector
   clickxy <target> <x> <y>          Click at CSS pixel coordinates (see coordinate note below)
   type    <target> <text>           Type text at current focus via Input.insertText
@@ -835,15 +1107,33 @@ DAEMON IPC (for advanced use / scripting)
     Request:  {"id":<number>, "cmd":"<command>", "targetId":"<id>", "args":["arg1","arg2",...]}
     Response: {"id":<number>, "ok":true,  "result":"<string>"}
            or {"id":<number>, "ok":false, "error":"<message>"}
-  Commands mirror the CLI: snap, eval, shot, html, nav, net, click, clickxy,
-  type, loadall, evalraw, stop. Use evalraw to send arbitrary CDP methods.
+  Commands mirror the CLI: stats, inspect, snap, eval, shot, html, nav, net,
+  click, clickxy, type, loadall, evalraw, stop. Use evalraw to send arbitrary CDP methods.
   The socket disappears when Chrome disconnects or after "cdp stop".
 `;
 
 const NEEDS_TARGET = new Set([
-  'snap','snapshot','eval','shot','screenshot','html','nav','navigate',
+  'inspect','snap','snapshot','eval','shot','screenshot','html','nav','navigate',
   'net','network','click','clickxy','type','loadall','evalraw',
 ]);
+
+async function resolveTargetId(targetPrefix) {
+  let pages;
+  if (!existsSync(PAGES_CACHE)) {
+    pages = await refreshPagesCache();
+  } else {
+    pages = JSON.parse(readFileSync(PAGES_CACHE, 'utf8'));
+  }
+
+  try {
+    return resolvePrefix(targetPrefix, pages.map(p => p.targetId), 'target', 'Run "cdp list".');
+  } catch (error) {
+    const message = String(error?.message || '');
+    if (!/No target matching prefix/.test(message)) throw error;
+    pages = await refreshPagesCache();
+    return resolvePrefix(targetPrefix, pages.map(p => p.targetId), 'target', 'Run "cdp list".');
+  }
+}
 
 async function main() {
   const [cmd, ...args] = process.argv.slice(2);
@@ -859,10 +1149,15 @@ async function main() {
     const conn = await getOrStartBrowserDaemon();
     const response = await sendCommand(conn, { cmd: 'list', args: [] });
     if (!response.ok) { console.error('Error:', response.error); process.exit(1); }
-    // Also refresh cache via list_raw
-    const conn2 = await getOrStartBrowserDaemon();
-    const raw = await sendCommand(conn2, { cmd: 'list_raw', args: [] });
-    if (raw.ok) writeFileSync(PAGES_CACHE, raw.result, { mode: 0o600 });
+    await refreshPagesCache().catch(() => {});
+    console.log(response.result);
+    return;
+  }
+
+  if (cmd === 'stats') {
+    const conn = await getOrStartBrowserDaemon();
+    const response = await sendCommand(conn, { cmd: 'stats', args: [] });
+    if (!response.ok) { console.error('Error:', response.error); process.exit(1); }
     console.log(response.result);
     return;
   }
@@ -899,12 +1194,7 @@ async function main() {
   }
 
   // Resolve prefix → full targetId from pages cache
-  if (!existsSync(PAGES_CACHE)) {
-    console.error('No page list cached. Run "cdp list" first.');
-    process.exit(1);
-  }
-  const pages = JSON.parse(readFileSync(PAGES_CACHE, 'utf8'));
-  const targetId = resolvePrefix(targetPrefix, pages.map(p => p.targetId), 'target', 'Run "cdp list".');
+  const targetId = await resolveTargetId(targetPrefix);
 
   const conn = await getOrStartBrowserDaemon();
 
