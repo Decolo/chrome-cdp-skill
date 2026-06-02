@@ -27,10 +27,11 @@ scripts/cdp.mjs list
 ### Take a screenshot
 
 ```bash
-scripts/cdp.mjs shot <target> [file]    # default: screenshot-<target>.png in runtime dir
+scripts/cdp.mjs shot <target> [file] [--selector ".card"]   # element-scoped capture
+scripts/cdp.mjs shot <target> [file] [--clip 0 120 800 500]  # clipped CSS-pixel region
 ```
 
-Captures the **viewport only**. Scroll first with `eval` if you need content below the fold. Output includes the page's DPR and coordinate conversion hint (see **Coordinates** below).
+By default, captures the **full viewport**. For a cheaper path, use `--selector` to capture one visible element or `--clip` to capture a specific CSS-pixel region inside the current viewport. Scroll first with `eval` if you need content below the fold. Output includes the page's DPR and coordinate conversion hint (see **Coordinates** below).
 
 ### Accessibility tree snapshot
 
@@ -81,7 +82,7 @@ scripts/cdp.mjs stop                           # stop the browser daemon
 
 ## Coordinates
 
-`shot` saves an image at native resolution: image pixels = CSS pixels × DPR. CDP Input events (`clickxy` etc.) take **CSS pixels**.
+`shot` saves an image at native resolution: image pixels = CSS pixels × DPR. CDP Input events (`clickxy` etc.) take **CSS pixels**. `--clip` coordinates also use CSS pixels.
 
 ```
 CSS px = screenshot image px / DPR
