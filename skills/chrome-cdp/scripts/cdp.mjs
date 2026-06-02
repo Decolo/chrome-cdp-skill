@@ -115,6 +115,58 @@ function getDisplayPrefixLength(targetIds) {
   return maxLen;
 }
 
+function parsePositiveNumber(value, label) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error(`${label} must be a positive number`);
+  }
+  return parsed;
+}
+
+function parseNumber(value, label) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    throw new Error(`${label} must be a number`);
+  }
+  return parsed;
+}
+
+function parseShotArgs(args) {
+  const options = {};
+  const positional = [];
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--selector') {
+      const selector = args[++i];
+      if (!selector) throw new Error('shot --selector requires a CSS selector');
+      options.selector = selector;
+      continue;
+    }
+    if (arg === '--clip') {
+      const x = parseNumber(args[++i], 'clip x');
+      const y = parseNumber(args[++i], 'clip y');
+      const width = parsePositiveNumber(args[++i], 'clip width');
+      const height = parsePositiveNumber(args[++i], 'clip height');
+      options.clip = { x, y, width, height };
+      continue;
+    }
+    positional.push(arg);
+  }
+
+  if (options.selector && options.clip) {
+    throw new Error('shot accepts either --selector or --clip, not both');
+  }
+  if (positional.length > 1) {
+    throw new Error('shot accepts at most one output file path');
+  }
+
+  return {
+    filePath: positional[0] || '',
+    options,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // CDP WebSocket client
 // ---------------------------------------------------------------------------
@@ -320,7 +372,71 @@ async function evalStr(cdp, sid, expression) {
   return typeof val === 'object' ? JSON.stringify(val, null, 2) : String(val ?? '');
 }
 
-async function shotStr(cdp, sid, filePath, targetId) {
+async function getShotPlan(cdp, sid, options) {
+  if (options?.clip) {
+    return {
+      clip: {
+        x: options.clip.x,
+        y: options.clip.y,
+        width: options.clip.width,
+        height: options.clip.height,
+        scale: 1,
+      },
+      scopeDescription: `clipped viewport region at CSS px x=${options.clip.x}, y=${options.clip.y}, width=${options.clip.width}, height=${options.clip.height}`,
+      note: 'Clip coordinates use CSS pixels in the current viewport, matching clickxy inputs.',
+    };
+  }
+
+  if (options?.selector) {
+    const expr = `
+      (function() {
+        const selector = ${JSON.stringify(options.selector)};
+        const el = document.querySelector(selector);
+        if (!el) return { ok: false, error: 'Element not found: ' + selector };
+        const rect = el.getBoundingClientRect();
+        if (!rect.width || !rect.height) {
+          return { ok: false, error: 'Element has zero size: ' + selector };
+        }
+        const x = Math.max(0, rect.left);
+        const y = Math.max(0, rect.top);
+        const right = Math.min(window.innerWidth, rect.right);
+        const bottom = Math.min(window.innerHeight, rect.bottom);
+        const width = right - x;
+        const height = bottom - y;
+        if (width <= 0 || height <= 0) {
+          return {
+            ok: false,
+            error: 'Element is outside the current viewport: ' + selector + '. Scroll it into view first.'
+          };
+        }
+        return {
+          ok: true,
+          selector,
+          clip: { x, y, width, height, scale: 1 },
+          clippedByViewport: width !== rect.width || height !== rect.height,
+        };
+      })()
+    `;
+    const raw = await evalStr(cdp, sid, expr);
+    const data = JSON.parse(raw);
+    if (!data.ok) throw new Error(data.error);
+    return {
+      clip: data.clip,
+      scopeDescription: `element-scoped region for selector ${JSON.stringify(data.selector)}`,
+      note: data.clippedByViewport
+        ? 'The selected element extended beyond the current viewport, so the screenshot was clipped to the visible portion. Scroll first if you need the whole element.'
+        : 'Selector coordinates use CSS pixels from the current viewport, matching clickxy inputs.',
+    };
+  }
+
+  return {
+    clip: null,
+    scopeDescription: 'full viewport',
+    note: null,
+  };
+}
+
+async function shotStr(cdp, sid, filePath, targetId, options = {}) {
   // Get device scale factor so we can report coordinate mapping
   let dpr = 1;
   try {
@@ -343,11 +459,16 @@ async function shotStr(cdp, sid, filePath, targetId) {
     } catch {}
   }
 
-  const { data } = await cdp.send('Page.captureScreenshot', { format: 'png' }, sid);
+  const shotPlan = await getShotPlan(cdp, sid, options);
+  const captureParams = { format: 'png' };
+  if (shotPlan.clip) captureParams.clip = shotPlan.clip;
+
+  const { data } = await cdp.send('Page.captureScreenshot', captureParams, sid);
   const out = filePath || resolve(RUNTIME_DIR, `screenshot-${(targetId || 'unknown').slice(0, 8)}.png`);
   writeFileSync(out, Buffer.from(data, 'base64'));
 
   const lines = [out];
+  lines.push(`Capture scope: ${shotPlan.scopeDescription}`);
   lines.push(`Screenshot saved. Device pixel ratio (DPR): ${dpr}`);
   lines.push(`Coordinate mapping:`);
   lines.push(`  Screenshot pixels → CSS pixels (for CDP Input events): divide by ${dpr}`);
@@ -355,6 +476,7 @@ async function shotStr(cdp, sid, filePath, targetId) {
   if (dpr !== 1) {
     lines.push(`  On this ${dpr}x display: CSS px = screenshot px / ${dpr} ≈ screenshot px × ${Math.round(100/dpr)/100}`);
   }
+  if (shotPlan.note) lines.push(shotPlan.note);
   return lines.join('\n');
 }
 
@@ -859,7 +981,10 @@ async function runBrowserDaemon() {
               case 'snap': case 'snapshot': return snapshotStr(cdp, sessionId, true);
               case 'inspect': return inspectStr(cdp, sessionId, args[0]);
               case 'eval': return evalStr(cdp, sessionId, args[0]);
-              case 'shot': case 'screenshot': return shotStr(cdp, sessionId, args[0], targetId);
+              case 'shot': case 'screenshot': {
+                const { filePath, options } = parseShotArgs(args);
+                return shotStr(cdp, sessionId, filePath, targetId, options);
+              }
               case 'html': return htmlStr(cdp, sessionId, args[0]);
               case 'nav': case 'navigate': return navStr(cdp, sessionId, args[0]);
               case 'net': case 'network': return netStr(cdp, sessionId);
@@ -1066,7 +1191,8 @@ Usage: cdp <command> [args]
   inspect <target> [selector]       Lightweight page summary (optionally scoped to CSS selector)
   snap  <target>                    Accessibility tree snapshot
   eval  <target> <expr>             Evaluate JS expression
-  shot  <target> [file]             Screenshot (default: screenshot-<target>.png in runtime dir); prints coordinate mapping
+  shot  <target> [file] [--selector <css> | --clip <x> <y> <w> <h>]
+                                    Screenshot (default: full viewport) with optional cheaper scoped capture
   html  <target> [selector]         Get HTML (scoped when selector is provided; truncates large output)
   nav   <target> <url>              Navigate to URL and wait for load completion
   net   <target>                    Slowest network performance entries
@@ -1085,7 +1211,8 @@ Usage: cdp <command> [args]
 use more characters.
 
 COORDINATE SYSTEM
-  shot captures the viewport at the device's native resolution.
+  shot captures the viewport at the device's native resolution by default.
+  Use --selector for an element-scoped screenshot or --clip for a CSS-pixel region.
   The screenshot image size = CSS pixels × DPR (device pixel ratio).
   For CDP Input events (clickxy, etc.) you need CSS pixels, not image pixels.
 

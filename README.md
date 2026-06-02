@@ -36,7 +36,8 @@ The CLI auto-detects Chrome, Chromium, Brave, Edge, and Vivaldi on macOS and Lin
 scripts/cdp.mjs list                              # list open tabs
 scripts/cdp.mjs stats                             # browser daemon health and recent command timings
 scripts/cdp.mjs inspect <target> [".selector"]    # lightweight page summary
-scripts/cdp.mjs shot   <target>                   # screenshot → runtime dir
+scripts/cdp.mjs shot   <target> [file] [--selector ".card" | --clip 0 120 800 500]
+                                                   # screenshot → runtime dir, with optional cheaper scoped capture
 scripts/cdp.mjs snap   <target>                   # accessibility tree (compact, semantic)
 scripts/cdp.mjs html   <target> [".selector"]     # scoped HTML, truncated when large
 scripts/cdp.mjs eval   <target> "expression"      # evaluate JS in page context
@@ -63,4 +64,4 @@ Connects directly to Chrome's remote debugging WebSocket — no Puppeteer, no in
 
 This approach is also why it handles 100+ open tabs reliably, where tools built on Puppeteer often time out during target enumeration.
 
-For agent workflows, start with `inspect` for page state. Prefer scoped `html` and one combined `eval` before escalating to `snap` or `shot`. Use `stats` when diagnosing slow local automation or checking whether the browser daemon is accumulating slow commands or oversized responses.
+For agent workflows, start with `inspect` for page state. Prefer scoped `html` and one combined `eval` before escalating to `snap` or `shot`. When you need visual proof, prefer `shot --selector` or `shot --clip` before taking a full viewport screenshot. Use `stats` when diagnosing slow local automation or checking whether the browser daemon is accumulating slow commands or oversized responses.
