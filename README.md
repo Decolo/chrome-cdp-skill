@@ -35,14 +35,17 @@ The CLI auto-detects Chrome, Chromium, Brave, Edge, and Vivaldi on macOS and Lin
 ```bash
 scripts/cdp.mjs list                              # list open tabs
 scripts/cdp.mjs stats                             # browser daemon health and recent command timings
-scripts/cdp.mjs inspect <target> [".selector"]    # lightweight page summary
+scripts/cdp.mjs inspect <target> [".selector"] [--limit 5] [--sections headings,buttons,text]
+                                                   # lightweight page summary with optional narrower scope
 scripts/cdp.mjs shot   <target> [file] [--selector ".card" | --clip 0 120 800 500]
                                                    # screenshot → runtime dir, with optional cheaper scoped capture
 scripts/cdp.mjs snap   <target>                   # accessibility tree (compact, semantic)
-scripts/cdp.mjs html   <target> [".selector"]     # scoped HTML, truncated when large
+scripts/cdp.mjs html   <target> [".selector"] [--text] [--max-chars 2000]
+                                                   # scoped HTML or text-only output, truncated when large
 scripts/cdp.mjs eval   <target> "expression"      # evaluate JS in page context
 scripts/cdp.mjs nav    <target> https://...       # navigate and wait for load
-scripts/cdp.mjs net    <target>                   # slowest network resource timing entries
+scripts/cdp.mjs net    <target> [--limit 10] [--type fetch] [--same-origin]
+                                                   # slowest network entries with optional narrower scope
 scripts/cdp.mjs click  <target> "selector"        # click element by CSS selector
 scripts/cdp.mjs clickxy <target> <x> <y>          # click at CSS pixel coordinates
 scripts/cdp.mjs type   <target> "text"            # type at focused element (works in cross-origin iframes)
@@ -64,4 +67,4 @@ Connects directly to Chrome's remote debugging WebSocket — no Puppeteer, no in
 
 This approach is also why it handles 100+ open tabs reliably, where tools built on Puppeteer often time out during target enumeration.
 
-For agent workflows, start with `inspect` for page state. Prefer scoped `html` and one combined `eval` before escalating to `snap` or `shot`. When you need visual proof, prefer `shot --selector` or `shot --clip` before taking a full viewport screenshot. Use `stats` when diagnosing slow local automation or checking whether the browser daemon is accumulating slow commands or oversized responses.
+For agent workflows, start with `inspect` for page state. Use `--sections`, `--limit`, or `--no-text` when you only need part of the summary. Prefer scoped `html` or `html --text` and one combined `eval` before escalating to `snap` or `shot`. When you need visual proof, prefer `shot --selector` or `shot --clip` before taking a full viewport screenshot. Use `net --type ...` or `--same-origin` before broad network reads, and use `stats` to distinguish setup-heavy commands, cache refreshes, and oversized responses.
