@@ -22,6 +22,7 @@ const MIN_TARGET_PREFIX_LEN = 8;
 const COMMAND_HISTORY_LIMIT = 50;
 const HTML_OUTPUT_LIMIT = 20000;
 const NET_ENTRY_LIMIT = 40;
+const METADATA_CACHE_TTL_MS = 1500;
 const IS_WINDOWS = process.platform === 'win32';
 if (!IS_WINDOWS) process.umask(0o077);
 const RUNTIME_DIR = IS_WINDOWS
@@ -165,6 +166,133 @@ function parseShotArgs(args) {
     filePath: positional[0] || '',
     options,
   };
+}
+
+function parseInteger(value, label) {
+  const parsed = Number.parseInt(String(value), 10);
+  if (!Number.isFinite(parsed)) {
+    throw new Error(`${label} must be an integer`);
+  }
+  return parsed;
+}
+
+function parsePositiveInteger(value, label) {
+  const parsed = parseInteger(value, label);
+  if (parsed <= 0) {
+    throw new Error(`${label} must be a positive integer`);
+  }
+  return parsed;
+}
+
+function splitCsv(value) {
+  return String(value || '')
+    .split(',')
+    .map(part => part.trim())
+    .filter(Boolean);
+}
+
+function formatBytes(bytes) {
+  if (!Number.isFinite(bytes) || bytes < 0) return '?B';
+  if (bytes < 1024) return `${bytes}B`;
+  if (bytes < 1024 * 1024) return `${Math.round((bytes / 1024) * 10) / 10}KB`;
+  return `${Math.round((bytes / (1024 * 1024)) * 10) / 10}MB`;
+}
+
+function parseInspectArgs(args) {
+  const options = { limit: 20, textMax: 700 };
+  const positional = [];
+  const validSections = new Set(['headings', 'buttons', 'links', 'inputs', 'forms', 'text']);
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--limit') {
+      options.limit = parsePositiveInteger(args[++i], 'inspect limit');
+      continue;
+    }
+    if (arg === '--text-max') {
+      options.textMax = parsePositiveInteger(args[++i], 'inspect text max');
+      continue;
+    }
+    if (arg === '--sections') {
+      const sections = splitCsv(args[++i]);
+      if (sections.length === 0) throw new Error('inspect --sections requires a comma-separated list');
+      for (const section of sections) {
+        if (!validSections.has(section)) {
+          throw new Error(`Unsupported inspect section: ${section}`);
+        }
+      }
+      options.sections = sections;
+      continue;
+    }
+    if (arg === '--no-text') {
+      options.noText = true;
+      continue;
+    }
+    positional.push(arg);
+  }
+
+  if (positional.length > 1) {
+    throw new Error('inspect accepts at most one selector');
+  }
+  if (options.noText) {
+    options.sections = (options.sections || ['headings', 'buttons', 'links', 'inputs', 'forms'])
+      .filter(section => section !== 'text');
+  }
+  return {
+    selector: positional[0] || '',
+    options,
+  };
+}
+
+function parseHtmlArgs(args) {
+  const options = { maxChars: HTML_OUTPUT_LIMIT };
+  const positional = [];
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--text') {
+      options.textOnly = true;
+      continue;
+    }
+    if (arg === '--max-chars') {
+      options.maxChars = parsePositiveInteger(args[++i], 'html max chars');
+      continue;
+    }
+    positional.push(arg);
+  }
+
+  if (positional.length > 1) {
+    throw new Error('html accepts at most one selector');
+  }
+  return {
+    selector: positional[0] || '',
+    options,
+  };
+}
+
+function parseNetArgs(args) {
+  const options = { limit: NET_ENTRY_LIMIT };
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--limit') {
+      options.limit = parsePositiveInteger(args[++i], 'net limit');
+      continue;
+    }
+    if (arg === '--type') {
+      const type = args[++i];
+      if (!type) throw new Error('net --type requires a resource type');
+      options.type = type;
+      continue;
+    }
+    if (arg === '--same-origin') {
+      options.sameOrigin = true;
+      continue;
+    }
+    throw new Error(`Unknown net option: ${arg}`);
+  }
+
+  return options;
 }
 
 // ---------------------------------------------------------------------------
@@ -480,18 +608,20 @@ async function shotStr(cdp, sid, filePath, targetId, options = {}) {
   return lines.join('\n');
 }
 
-async function htmlStr(cdp, sid, selector) {
+async function htmlStr(cdp, sid, selector, options = {}) {
   const expr = `
     (function() {
       const selector = ${JSON.stringify(selector || '')};
       const root = selector ? document.querySelector(selector) : document.documentElement;
       if (!root) return { ok: false, error: 'Element not found: ' + selector };
+      const text = (root.innerText || root.textContent || '').replace(/\\s+/g, ' ').trim();
       const html = root.outerHTML || '';
       return {
         ok: true,
         selector: selector || 'document.documentElement',
         html,
-        truncated: html.length > ${HTML_OUTPUT_LIMIT},
+        text,
+        truncated: html.length > ${Math.max(1, options.maxChars || HTML_OUTPUT_LIMIT)},
         totalLength: html.length,
       };
     })()
@@ -499,7 +629,15 @@ async function htmlStr(cdp, sid, selector) {
   const raw = await evalStr(cdp, sid, expr);
   const data = JSON.parse(raw);
   if (!data.ok) throw new Error(data.error);
-  const html = truncateText(data.html, HTML_OUTPUT_LIMIT);
+  if (options.textOnly) {
+    const text = truncateText(data.text || '', options.maxChars || HTML_OUTPUT_LIMIT);
+    return [
+      `HTML scope: ${data.selector}`,
+      'Output mode: text',
+      text,
+    ].join('\n');
+  }
+  const html = truncateText(data.html, options.maxChars || HTML_OUTPUT_LIMIT);
   if (!data.truncated) return html;
   return [
     `HTML scope: ${data.selector}`,
@@ -518,15 +656,16 @@ function formatElementSummary(item) {
   return parts.join(' ');
 }
 
-async function inspectStr(cdp, sid, selector) {
+async function inspectStr(cdp, sid, selector, options = {}) {
   const expr = `
     (function() {
       const selector = ${JSON.stringify(selector || '')};
       const root = selector ? document.querySelector(selector) : document.body;
       if (!root) return { ok: false, error: 'Element not found: ' + selector };
 
-      const MAX_TEXT = 700;
-      const MAX_ITEMS = 20;
+      const MAX_TEXT = ${Math.max(1, options.textMax || 700)};
+      const MAX_ITEMS = ${Math.max(1, options.limit || 20)};
+      const sections = new Set(${JSON.stringify(options.sections || ['headings', 'buttons', 'links', 'inputs', 'forms', 'text'])});
       const textOf = (el, max = 90) => (el.innerText || el.textContent || '')
         .replace(/\\s+/g, ' ')
         .trim()
@@ -593,13 +732,14 @@ async function inspectStr(cdp, sid, selector) {
         title: document.title,
         url: location.href,
         readyState: document.readyState,
+        sections: Array.from(sections),
         active,
-        headings: takeVisible('h1,h2,h3'),
-        buttons: takeVisible('button,[role="button"],input[type="button"],input[type="submit"]'),
-        links: takeVisible('a[href]'),
-        inputs: takeVisible('input:not([type="button"]):not([type="submit"]),textarea,select'),
-        forms: takeVisible('form'),
-        text: textOf(root, MAX_TEXT),
+        headings: sections.has('headings') ? takeVisible('h1,h2,h3') : [],
+        buttons: sections.has('buttons') ? takeVisible('button,[role="button"],input[type="button"],input[type="submit"]') : [],
+        links: sections.has('links') ? takeVisible('a[href]') : [],
+        inputs: sections.has('inputs') ? takeVisible('input:not([type="button"]):not([type="submit"]),textarea,select') : [],
+        forms: sections.has('forms') ? takeVisible('form') : [],
+        text: sections.has('text') ? textOf(root, MAX_TEXT) : '',
         counts: {
           buttons: root.querySelectorAll('button,[role="button"],input[type="button"],input[type="submit"]').length,
           links: root.querySelectorAll('a[href]').length,
@@ -618,6 +758,7 @@ async function inspectStr(cdp, sid, selector) {
     `URL: ${data.url}`,
     `Ready state: ${data.readyState}`,
     `Scope: ${data.scopedTo}`,
+    `Sections: ${data.sections.join(', ')}`,
   ];
   if (data.active) lines.push(`Focused: ${formatElementSummary(data.active)}`);
 
@@ -631,11 +772,11 @@ async function inspectStr(cdp, sid, selector) {
     for (const item of items) lines.push(`  - ${formatElementSummary(item)}`);
   };
 
-  addSection('Headings', data.headings, data.headings.length);
-  addSection('Buttons', data.buttons, data.counts.buttons);
-  addSection('Links', data.links, data.counts.links);
-  addSection('Inputs', data.inputs, data.counts.inputs);
-  addSection('Forms', data.forms, data.counts.forms);
+  if (data.sections.includes('headings')) addSection('Headings', data.headings, data.headings.length);
+  if (data.sections.includes('buttons')) addSection('Buttons', data.buttons, data.counts.buttons);
+  if (data.sections.includes('links')) addSection('Links', data.links, data.counts.links);
+  if (data.sections.includes('inputs')) addSection('Inputs', data.inputs, data.counts.inputs);
+  if (data.sections.includes('forms')) addSection('Forms', data.forms, data.counts.forms);
   if (data.text) {
     lines.push('');
     lines.push('Text sample');
@@ -693,25 +834,40 @@ async function navStr(cdp, sid, url) {
   return `Navigated to ${url}`;
 }
 
-async function netStr(cdp, sid) {
+async function netStr(cdp, sid, options = {}) {
   const raw = await evalStr(cdp, sid, `JSON.stringify((() => {
+    const wantedType = ${JSON.stringify(options.type || '')};
+    const sameOriginOnly = ${options.sameOrigin ? 'true' : 'false'};
     const entries = performance.getEntriesByType('resource')
       .map(e => ({
         name: e.name.substring(0, 120),
         type: e.initiatorType || 'other',
         duration: Math.round(e.duration),
-        size: e.transferSize || 0
+        size: e.transferSize || 0,
+        sameOrigin: (() => {
+          try { return new URL(e.name, location.href).origin === location.origin; } catch { return false; }
+        })()
       }))
+      .filter(e => !wantedType || e.type === wantedType)
+      .filter(e => !sameOriginOnly || e.sameOrigin)
       .sort((a, b) => b.duration - a.duration);
     return {
       total: entries.length,
-      entries: entries.slice(0, ${NET_ENTRY_LIMIT})
+      entries: entries.slice(0, ${Math.max(1, options.limit || NET_ENTRY_LIMIT)})
     };
   })())`);
   const data = JSON.parse(raw);
-  const lines = data.entries.map(e =>
+  const lines = [];
+  if (options.type || options.sameOrigin) {
+    const scope = [
+      options.type ? `type=${options.type}` : '',
+      options.sameOrigin ? 'same-origin only' : '',
+    ].filter(Boolean).join(', ');
+    lines.push(`Network scope: ${scope}`);
+  }
+  lines.push(...data.entries.map(e =>
     `${String(e.duration).padStart(5)}ms  ${String(e.size || '?').padStart(8)}B  ${e.type.padEnd(8)}  ${e.name}`
-  );
+  ));
   if (data.total > data.entries.length) {
     lines.unshift(`Showing slowest ${data.entries.length} of ${data.total} resource entries`);
     lines.unshift('');
@@ -816,6 +972,96 @@ async function runBrowserDaemon() {
   const sessions = new Map();
   const startedAt = Date.now();
   const commandHistory = [];
+  const metadataCache = {
+    pages: { value: null, cachedAt: 0, hits: 0, misses: 0, refreshes: 0 },
+    targetIds: new Map(),
+  };
+
+  function clearTargetResolutionCache() {
+    metadataCache.targetIds.clear();
+  }
+
+  function cachePages(pages, reason = 'refresh') {
+    metadataCache.pages.value = pages;
+    metadataCache.pages.cachedAt = Date.now();
+    metadataCache.pages.refreshes++;
+    if (reason !== 'reuse') clearTargetResolutionCache();
+    return pages;
+  }
+
+  function getCachedPages() {
+    const ageMs = Date.now() - metadataCache.pages.cachedAt;
+    if (metadataCache.pages.value && ageMs <= METADATA_CACHE_TTL_MS) {
+      metadataCache.pages.hits++;
+      return metadataCache.pages.value;
+    }
+    metadataCache.pages.misses++;
+    return null;
+  }
+
+  async function getPagesCached(forceRefresh = false) {
+    if (!forceRefresh) {
+      const cached = getCachedPages();
+      if (cached) return { pages: cached, cacheStatus: 'hit', cacheAgeMs: Date.now() - metadataCache.pages.cachedAt };
+    }
+    const pages = await getPages(cdp);
+    cachePages(pages);
+    return { pages, cacheStatus: forceRefresh ? 'forced-refresh' : 'refresh', cacheAgeMs: 0 };
+  }
+
+  function rememberResolvedTarget(prefix, targetId) {
+    metadataCache.targetIds.set(prefix.toUpperCase(), { targetId, cachedAt: Date.now() });
+  }
+
+  function getResolvedTarget(prefix) {
+    const entry = metadataCache.targetIds.get(prefix.toUpperCase());
+    if (!entry) return null;
+    if (Date.now() - entry.cachedAt > METADATA_CACHE_TTL_MS) {
+      metadataCache.targetIds.delete(prefix.toUpperCase());
+      return null;
+    }
+    return entry.targetId;
+  }
+
+  async function resolveTargetPrefix(prefix) {
+    const started = Date.now();
+    const cachedTargetId = getResolvedTarget(prefix);
+    if (cachedTargetId) {
+      return {
+        targetId: cachedTargetId,
+        pages: metadataCache.pages.value || [],
+        trace: {
+          resolveMs: Date.now() - started,
+          pageListMs: 0,
+          pageCacheStatus: 'target-hit',
+        },
+      };
+    }
+
+    const firstLookupStarted = Date.now();
+    let pageSnapshot = await getPagesCached();
+    let pages = pageSnapshot.pages;
+    let targetId;
+    try {
+      targetId = resolvePrefix(prefix, pages.map(p => p.targetId), 'target', 'Run "cdp list".');
+    } catch (error) {
+      const message = String(error?.message || '');
+      if (!/No target matching prefix/.test(message)) throw error;
+      pageSnapshot = await getPagesCached(true);
+      pages = pageSnapshot.pages;
+      targetId = resolvePrefix(prefix, pages.map(p => p.targetId), 'target', 'Run "cdp list".');
+    }
+    rememberResolvedTarget(prefix, targetId);
+    return {
+      targetId,
+      pages,
+      trace: {
+        resolveMs: Date.now() - started,
+        pageListMs: Date.now() - firstLookupStarted,
+        pageCacheStatus: pageSnapshot.cacheStatus,
+      },
+    };
+  }
 
   function recordCommand(entry) {
     commandHistory.push(entry);
@@ -823,7 +1069,8 @@ async function runBrowserDaemon() {
   }
 
   async function statsStr() {
-    const pages = await getPages(cdp).catch(() => []);
+    const pageSnapshot = await getPagesCached().catch(() => ({ pages: [], cacheStatus: 'error', cacheAgeMs: 0 }));
+    const pages = pageSnapshot.pages;
     const slowest = [...commandHistory]
       .sort((a, b) => b.durationMs - a.durationMs)
       .slice(0, 5);
@@ -836,6 +1083,9 @@ async function runBrowserDaemon() {
       `Socket: ${BROWSER_SOCK}`,
       `Sessions: ${sessions.size}`,
       `Pages: ${pages.length}`,
+      `Metadata cache TTL: ${METADATA_CACHE_TTL_MS}ms`,
+      `Page cache: ${metadataCache.pages.value ? pageSnapshot.cacheStatus : 'empty'} (hits=${metadataCache.pages.hits}, misses=${metadataCache.pages.misses}, refreshes=${metadataCache.pages.refreshes})`,
+      `Resolved target cache entries: ${metadataCache.targetIds.size}`,
       `Recent commands: ${commandHistory.length}/${COMMAND_HISTORY_LIMIT}`,
       `Last error: ${lastError ? `${lastError.cmd}${lastError.targetId ? ` target=${lastError.targetId.slice(0, 8)}` : ''}: ${lastError.error}` : '(none)'}`,
     ];
@@ -844,8 +1094,13 @@ async function runBrowserDaemon() {
       const target = entry.targetId ? ` target=${entry.targetId.slice(0, 8)}` : '';
       const status = entry.ok ? 'ok' : 'error';
       const error = entry.error ? ` (${entry.error})` : '';
-      const size = entry.resultBytes != null ? ` ${entry.resultBytes}B` : '';
-      return `  - ${entry.cmd}${target}: ${formatDuration(entry.durationMs)}${size} ${status}${error}`;
+      const size = entry.resultBytes != null ? ` ${formatBytes(entry.resultBytes)}` : '';
+      const setup = entry.setupMs != null ? ` setup=${formatDuration(entry.setupMs)}` : '';
+      const body = entry.commandMs != null ? ` body=${formatDuration(entry.commandMs)}` : '';
+      const resolve = entry.resolveMs != null ? ` resolve=${formatDuration(entry.resolveMs)}` : '';
+      const pageList = entry.pageListMs != null ? ` pages=${formatDuration(entry.pageListMs)}${entry.pageCacheStatus ? `(${entry.pageCacheStatus})` : ''}` : '';
+      const attach = entry.attachMs != null ? ` attach=${formatDuration(entry.attachMs)}${entry.attachMode ? `(${entry.attachMode})` : ''}` : '';
+      return `  - ${entry.cmd}${target}: ${formatDuration(entry.durationMs)}${size}${resolve}${pageList}${setup}${attach}${body} ${status}${error}`;
     };
 
     lines.push('');
@@ -906,6 +1161,7 @@ async function runBrowserDaemon() {
   // Clean up sessions when targets go away
   cdp.onEvent('Target.targetDestroyed', (params) => {
     sessions.delete(params.targetId);
+    clearTargetResolutionCache();
   });
   cdp.onEvent('Target.detachedFromTarget', (params) => {
     for (const [tid, sid] of sessions) {
@@ -925,30 +1181,48 @@ async function runBrowserDaemon() {
 
   // Get or wait for a session for a given targetId.
   async function getSession(targetId) {
-    if (sessions.has(targetId)) return sessions.get(targetId);
+    if (sessions.has(targetId)) return { sessionId: sessions.get(targetId), attachMs: 0, attachMode: 'reuse' };
+    const started = Date.now();
     // Wait up to 500ms for the two-level attach events to settle
     for (let i = 0; i < 10; i++) {
       await sleep(50);
-      if (sessions.has(targetId)) return sessions.get(targetId);
+      if (sessions.has(targetId)) {
+        return { sessionId: sessions.get(targetId), attachMs: Date.now() - started, attachMode: 'wait' };
+      }
     }
     // Fallback for Chrome versions without 'tab' target support
     const res = await cdp.send('Target.attachToTarget', { targetId, flatten: true });
     sessions.set(targetId, res.sessionId);
-    return res.sessionId;
+    return { sessionId: res.sessionId, attachMs: Date.now() - started, attachMode: 'attach' };
   }
 
   // Handle a command; targetId is required for tab-specific commands
   async function runCommand({ cmd, targetId, args }) {
+    const trace = {
+      pageCacheStatus: '',
+      pageListMs: 0,
+      resolveMs: 0,
+      setupMs: 0,
+      attachMs: 0,
+      attachMode: '',
+      commandMs: 0,
+    };
     try {
       let result;
       switch (cmd) {
         case 'list': {
-          const pages = await getPages(cdp);
+          const pageListStarted = Date.now();
+          const { pages, cacheStatus } = await getPagesCached();
+          trace.pageListMs = Date.now() - pageListStarted;
+          trace.pageCacheStatus = cacheStatus;
           result = formatPageList(pages);
           break;
         }
         case 'list_raw': {
-          const pages = await getPages(cdp);
+          const pageListStarted = Date.now();
+          const { pages, cacheStatus } = await getPagesCached();
+          trace.pageListMs = Date.now() - pageListStarted;
+          trace.pageCacheStatus = cacheStatus;
           result = JSON.stringify(pages);
           break;
         }
@@ -956,12 +1230,26 @@ async function runBrowserDaemon() {
           result = await statsStr();
           break;
         }
+        case 'resolve_target': {
+          const targetPrefix = args[0];
+          if (!targetPrefix) return { ok: false, error: 'target prefix required', trace };
+          const resolved = await resolveTargetPrefix(targetPrefix);
+          trace.resolveMs = resolved.trace.resolveMs;
+          trace.pageListMs = resolved.trace.pageListMs;
+          trace.pageCacheStatus = resolved.trace.pageCacheStatus;
+          result = JSON.stringify({ targetId: resolved.targetId, pages: resolved.pages });
+          break;
+        }
         case 'open': {
           const url = args[0] || 'about:blank';
           const { targetId } = await cdp.send('Target.createTarget', { url });
-          const pages = await getPages(cdp);
+          const pageListStarted = Date.now();
+          const { pages } = await getPagesCached(true);
+          trace.pageListMs = Date.now() - pageListStarted;
+          trace.pageCacheStatus = 'forced-refresh';
           if (!pages.some(p => p.targetId === targetId)) {
             pages.push({ targetId, title: url, url });
+            cachePages(pages, 'reuse');
           }
           result = JSON.stringify({ targetId, pages });
           break;
@@ -969,41 +1257,79 @@ async function runBrowserDaemon() {
         case 'stop': return { ok: true, result: '', stopAfter: true };
         default: {
           if (!targetId) return { ok: false, error: 'targetId required for this command' };
-          let sid;
+          let session;
           try {
-            sid = await getSession(targetId);
+            const setupStarted = Date.now();
+            session = await getSession(targetId);
+            trace.setupMs = Date.now() - setupStarted;
+            trace.attachMs = session.attachMs;
+            trace.attachMode = session.attachMode;
           } catch (e) {
-            return { ok: false, error: `Failed to attach to tab: ${e.message}` };
+            return { ok: false, error: `Failed to attach to tab: ${e.message}`, trace };
           }
           // Execute command; on session error, evict cache and retry once
           const run = async (sessionId) => {
+            const commandStarted = Date.now();
+            let commandResult;
             switch (cmd) {
-              case 'snap': case 'snapshot': return snapshotStr(cdp, sessionId, true);
-              case 'inspect': return inspectStr(cdp, sessionId, args[0]);
-              case 'eval': return evalStr(cdp, sessionId, args[0]);
+              case 'snap': case 'snapshot':
+                commandResult = await snapshotStr(cdp, sessionId, true);
+                break;
+              case 'inspect': {
+                const { selector, options } = parseInspectArgs(args);
+                commandResult = await inspectStr(cdp, sessionId, selector, options);
+                break;
+              }
+              case 'eval':
+                commandResult = await evalStr(cdp, sessionId, args[0]);
+                break;
               case 'shot': case 'screenshot': {
                 const { filePath, options } = parseShotArgs(args);
-                return shotStr(cdp, sessionId, filePath, targetId, options);
+                commandResult = await shotStr(cdp, sessionId, filePath, targetId, options);
+                break;
               }
-              case 'html': return htmlStr(cdp, sessionId, args[0]);
-              case 'nav': case 'navigate': return navStr(cdp, sessionId, args[0]);
-              case 'net': case 'network': return netStr(cdp, sessionId);
-              case 'click': return clickStr(cdp, sessionId, args[0]);
-              case 'clickxy': return clickXyStr(cdp, sessionId, args[0], args[1]);
-              case 'type': return typeStr(cdp, sessionId, args[0]);
-              case 'loadall': return loadAllStr(cdp, sessionId, args[0], args[1] ? parseInt(args[1]) : 1500);
-              case 'evalraw': return evalRawStr(cdp, sessionId, args[0], args[1]);
+              case 'html': {
+                const { selector, options } = parseHtmlArgs(args);
+                commandResult = await htmlStr(cdp, sessionId, selector, options);
+                break;
+              }
+              case 'nav': case 'navigate':
+                commandResult = await navStr(cdp, sessionId, args[0]);
+                break;
+              case 'net': case 'network':
+                commandResult = await netStr(cdp, sessionId, parseNetArgs(args));
+                break;
+              case 'click':
+                commandResult = await clickStr(cdp, sessionId, args[0]);
+                break;
+              case 'clickxy':
+                commandResult = await clickXyStr(cdp, sessionId, args[0], args[1]);
+                break;
+              case 'type':
+                commandResult = await typeStr(cdp, sessionId, args[0]);
+                break;
+              case 'loadall':
+                commandResult = await loadAllStr(cdp, sessionId, args[0], args[1] ? parseInt(args[1]) : 1500);
+                break;
+              case 'evalraw':
+                commandResult = await evalRawStr(cdp, sessionId, args[0], args[1]);
+                break;
               default: throw new Error(`Unknown command: ${cmd}`);
             }
+            trace.commandMs = Date.now() - commandStarted;
+            return commandResult;
           };
           try {
-            result = await run(sid);
+            result = await run(session.sessionId);
           } catch (e) {
             // If session is stale, re-attach once
             if (/session|Session|detach|Detach/.test(e.message)) {
               sessions.delete(targetId);
-              sid = await getSession(targetId);
-              result = await run(sid);
+              clearTargetResolutionCache();
+              session = await getSession(targetId);
+              trace.attachMs += session.attachMs;
+              trace.attachMode = trace.attachMode ? `${trace.attachMode}+reattach` : 'reattach';
+              result = await run(session.sessionId);
             } else {
               throw e;
             }
@@ -1011,9 +1337,9 @@ async function runBrowserDaemon() {
           break;
         }
       }
-      return { ok: true, result: result ?? '' };
+      return { ok: true, result: result ?? '', trace };
     } catch (e) {
-      return { ok: false, error: e.message };
+      return { ok: false, error: e.message, trace };
     }
   }
 
@@ -1026,6 +1352,13 @@ async function runBrowserDaemon() {
         targetId: req.targetId,
         durationMs: Date.now() - started,
         resultBytes: Buffer.byteLength(String(res.result || ''), 'utf8'),
+        resolveMs: res.trace?.resolveMs ?? 0,
+        pageListMs: res.trace?.pageListMs ?? 0,
+        pageCacheStatus: res.trace?.pageCacheStatus || '',
+        setupMs: res.trace?.setupMs ?? 0,
+        attachMs: res.trace?.attachMs ?? 0,
+        attachMode: res.trace?.attachMode || '',
+        commandMs: res.trace?.commandMs ?? 0,
         ok: !!res.ok,
         error: res.ok ? '' : String(res.error || '').slice(0, 120),
       });
@@ -1178,6 +1511,17 @@ async function refreshPagesCache() {
   return JSON.parse(raw.result);
 }
 
+async function resolveTargetId(targetPrefix) {
+  const conn = await getOrStartBrowserDaemon();
+  const response = await sendCommand(conn, { cmd: 'resolve_target', args: [targetPrefix] });
+  if (!response.ok) throw new Error(response.error || 'Failed to resolve target');
+  const data = JSON.parse(response.result);
+  if (data.pages) {
+    writeFileSync(PAGES_CACHE, JSON.stringify(data.pages), { mode: 0o600 });
+  }
+  return data.targetId;
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -1188,14 +1532,17 @@ Usage: cdp <command> [args]
 
   list                              List open pages (shows unique target prefixes)
   stats                             Show browser daemon health and recent command timings
-  inspect <target> [selector]       Lightweight page summary (optionally scoped to CSS selector)
+  inspect <target> [selector] [--limit <n>] [--sections a,b,c] [--text-max <n>] [--no-text]
+                                    Lightweight page summary with optional section/output scoping
   snap  <target>                    Accessibility tree snapshot
   eval  <target> <expr>             Evaluate JS expression
   shot  <target> [file] [--selector <css> | --clip <x> <y> <w> <h>]
                                     Screenshot (default: full viewport) with optional cheaper scoped capture
-  html  <target> [selector]         Get HTML (scoped when selector is provided; truncates large output)
+  html  <target> [selector] [--text] [--max-chars <n>]
+                                    Get scoped HTML or text-only output with bounded size
   nav   <target> <url>              Navigate to URL and wait for load completion
-  net   <target>                    Slowest network performance entries
+  net   <target> [--limit <n>] [--type <initiator>] [--same-origin]
+                                    Slowest network entries with optional narrower scope
   click   <target> <selector>       Click an element by CSS selector
   clickxy <target> <x> <y>          Click at CSS pixel coordinates (see coordinate note below)
   type    <target> <text>           Type text at current focus via Input.insertText
@@ -1243,24 +1590,6 @@ const NEEDS_TARGET = new Set([
   'inspect','snap','snapshot','eval','shot','screenshot','html','nav','navigate',
   'net','network','click','clickxy','type','loadall','evalraw',
 ]);
-
-async function resolveTargetId(targetPrefix) {
-  let pages;
-  if (!existsSync(PAGES_CACHE)) {
-    pages = await refreshPagesCache();
-  } else {
-    pages = JSON.parse(readFileSync(PAGES_CACHE, 'utf8'));
-  }
-
-  try {
-    return resolvePrefix(targetPrefix, pages.map(p => p.targetId), 'target', 'Run "cdp list".');
-  } catch (error) {
-    const message = String(error?.message || '');
-    if (!/No target matching prefix/.test(message)) throw error;
-    pages = await refreshPagesCache();
-    return resolvePrefix(targetPrefix, pages.map(p => p.targetId), 'target', 'Run "cdp list".');
-  }
-}
 
 async function main() {
   const [cmd, ...args] = process.argv.slice(2);

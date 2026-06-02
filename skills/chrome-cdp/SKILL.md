@@ -42,10 +42,10 @@ scripts/cdp.mjs snap <target>
 ### Lightweight page inspection
 
 ```bash
-scripts/cdp.mjs inspect <target> [selector]
+scripts/cdp.mjs inspect <target> [selector] [--limit 5] [--sections headings,buttons,text] [--no-text]
 ```
 
-Use `inspect` first for page state: title, URL, ready state, focus, visible controls, links, inputs, forms, headings, and a bounded text sample. Prefer scoped `html` or one combined `eval` before escalating to `snap` for full accessibility structure or `shot` for visual evidence.
+Use `inspect` first for page state: title, URL, ready state, focus, visible controls, links, inputs, forms, headings, and a bounded text sample. When you only need part of that, reduce the payload with `--sections`, `--limit`, or `--no-text`. Prefer scoped `html`, `html --text`, or one combined `eval` before escalating to `snap` for full accessibility structure or `shot` for visual evidence.
 
 ### Daemon stats
 
@@ -54,6 +54,8 @@ scripts/cdp.mjs stats
 ```
 
 Shows browser daemon uptime, session/page counts, and recent command timings. Use this when local Chrome automation feels slow or resource-heavy.
+
+`stats` also shows short-TTL metadata cache behavior and separates recent command cost into setup, attach, page-enumeration, and command-body timing where relevant.
 
 ### Evaluate JavaScript
 
@@ -66,10 +68,10 @@ scripts/cdp.mjs eval <target> <expr>
 ### Other commands
 
 ```bash
-scripts/cdp.mjs html    <target> [selector]   # scoped HTML, truncated when large
-scripts/cdp.mjs inspect <target> [selector]   # lightweight page summary
+scripts/cdp.mjs html    <target> [selector] [--text] [--max-chars 2000]  # scoped HTML or text-only output
+scripts/cdp.mjs inspect <target> [selector] [--limit 5] [--sections headings,buttons,text] [--no-text]
 scripts/cdp.mjs nav     <target> <url>         # navigate and wait for load
-scripts/cdp.mjs net     <target>               # slowest resource timing entries
+scripts/cdp.mjs net     <target> [--limit 10] [--type fetch] [--same-origin]  # narrower network view
 scripts/cdp.mjs click   <target> <selector>    # click element by CSS selector
 scripts/cdp.mjs clickxy <target> <x> <y>       # click at CSS pixel coords
 scripts/cdp.mjs type    <target> <text>         # Input.insertText at current focus; works in cross-origin iframes unlike eval
@@ -93,7 +95,9 @@ CSS px = screenshot image px / DPR
 ## Tips
 
 - Prefer `inspect` for first-pass page state; use scoped `html` or one combined `eval` before reaching for `snap` or `shot`.
+- Use `inspect --sections ...` or `html --text` when a full read would waste output budget.
 - Use `type` (not eval) to enter text in cross-origin iframes — `click`/`clickxy` to focus first, then `type`.
 - Prefer one combined `eval` over many small `eval` calls when collecting structured page data.
-- Use `stats` to spot commands that return unusually large payloads, not just slow ones.
+- Use `net --same-origin` or `--type` before broad resource listings when you only need one slice.
+- Use `stats` to spot commands that are setup-heavy or return unusually large payloads, not just slow ones.
 - Chrome shows an "Allow debugging" modal once per Chrome session. A background browser daemon keeps the CDP connection alive so subsequent commands need no further approval until Chrome disconnects or you run `stop`.
