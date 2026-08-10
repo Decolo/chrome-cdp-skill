@@ -640,9 +640,9 @@ class CDP {
 // Command implementations — return strings, take (cdp, sessionId)
 // ---------------------------------------------------------------------------
 
-async function getPages(cdp) {
+async function getPages(cdp, { includeInternal = false } = {}) {
   const { targetInfos } = await cdp.send('Target.getTargets');
-  return targetInfos.filter(t => t.type === 'page' && !t.url.startsWith('chrome://'));
+  return targetInfos.filter(t => t.type === 'page' && (includeInternal || !t.url.startsWith('chrome://')));
 }
 
 function formatPageList(pages) {
@@ -1306,12 +1306,12 @@ async function runBrowserDaemon() {
     return null;
   }
 
-  async function getPagesCached(forceRefresh = false) {
+  async function getPagesCached(forceRefresh = false, opts = {}) {
     if (!forceRefresh) {
       const cached = getCachedPages();
       if (cached) return { pages: cached, cacheStatus: 'hit', cacheAgeMs: Date.now() - metadataCache.pages.cachedAt };
     }
-    const pages = await getPages(cdp);
+    const pages = await getPages(cdp, opts);
     cachePages(pages);
     return { pages, cacheStatus: forceRefresh ? 'forced-refresh' : 'refresh', cacheAgeMs: 0 };
   }
@@ -1553,7 +1553,9 @@ async function runBrowserDaemon() {
           const url = args[0] || 'about:blank';
           // Reuse a blank tab (about:blank / new-tab page) when one exists —
           // never touch the user's real tabs.
-          const { pages: tabsBefore } = await getPagesCached(true);
+          // Full enumeration including chrome:// pages so a real new-tab page
+          // (chrome://newtab) is reusable; bypasses the shared filter cache.
+          const tabsBefore = await getPages(cdp, { includeInternal: true });
           const reusable = findReusableTab(tabsBefore);
           let targetId;
           if (reusable) {
@@ -1884,7 +1886,11 @@ async function getOrStartBrowserDaemon() {
       await sleep(DAEMON_CONNECT_DELAY);
       try { return await connectToSocket(BROWSER_SOCK); } catch {}
     }
-    throw new Error('Browser daemon failed to start — did you click Allow in Chrome?');
+    throw new Error(
+      'Chrome debugging is on but the browser rejected the CDP connection. ' +
+      'Chrome 151 shows an "Allow debugging" prompt — click Allow in Chrome, ' +
+      'then rerun this command. (Until approved, connections fail.)',
+    );
   } finally {
     releaseSpawnLock();
   }
@@ -2066,7 +2072,7 @@ async function main() {
       // CDP unavailable (Chrome running without remote debugging): fall back
       // to the system-level open so "open a tab" always works on macOS.
       if (process.platform === 'darwin' && openUrlViaAppleScript(url)) {
-        console.log(`Opened ${url} via system (Chrome remote debugging off; daemon unavailable)`);
+        console.log(`Opened ${url} via system (CDP unavailable — see message above)`);
         return;
       }
       console.error('Error:', e.message);
@@ -2166,6 +2172,7 @@ export {
   ensureChromeAvailable,
   findReusableTab,
   localStateUserEnabled,
+  getPages,
 };
 
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;

@@ -10,6 +10,7 @@ import {
   devToolsPortLive,
   findDevToolsActivePortFile,
   localStateUserEnabled,
+  getPages,
 } from '../skills/chrome-cdp/scripts/cdp.mjs';
 
 function tempDir(t) {
@@ -17,6 +18,30 @@ function tempDir(t) {
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   return dir;
 }
+
+// ---------------------------------------------------------------------------
+// getPages: default view hides chrome:// pages, but open must see them so a
+// real chrome://newtab tab is reusable (regression: open never reused
+// new-tab pages because the filtered enumeration hid them)
+// ---------------------------------------------------------------------------
+
+test('getPages filters chrome:// pages by default but includes them with includeInternal', async () => {
+  const fakeCdp = {
+    send: async () => ({
+      targetInfos: [
+        { targetId: 'A', type: 'page', url: 'https://x.com/home' },
+        { targetId: 'B', type: 'page', url: 'chrome://newtab/' },
+        { targetId: 'C', type: 'page', url: 'about:blank' },
+        { targetId: 'D', type: 'other', url: 'https://example.com' },
+      ],
+    }),
+  };
+  const filtered = await getPages(fakeCdp);
+  assert.deepEqual(filtered.map(p => p.targetId), ['A', 'C'], 'default: chrome:// pages hidden, non-page targets hidden');
+
+  const full = await getPages(fakeCdp, { includeInternal: true });
+  assert.deepEqual(full.map(p => p.targetId), ['A', 'B', 'C'], 'includeInternal: chrome://newtab visible for reuse');
+});
 
 // ---------------------------------------------------------------------------
 // findReusableTab: blank tabs are reused, real tabs are never touched
