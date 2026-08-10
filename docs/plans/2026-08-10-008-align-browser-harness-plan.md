@@ -147,3 +147,23 @@ Subagent review (Standards + Spec axes) findings fixed in one commit:
 - launchChrome parses launch args once instead of per-branch.
 - Tests: 29/29. Daemon response gained additive `reusedTab`/`text` fields
   (CLI protocol backward-compatible).
+
+## Addendum 3: inspect-tab lifecycle — fully borrowed from browser-harness (2026-08-10)
+
+Borrowed their whole permission-tab lifecycle to reduce Allow-popup friction:
+
+- `~/.cache/cdp/inspect-opened` marker (their `inspect_marker()`): written when
+  the guide opens `chrome://inspect`, with a 180s reopen TTL
+  (`_open_chrome_inspect_once` equivalent) so repeated commands don't spawn
+  tab after tab.
+- Daemon `closeInspectTabs()` after a successful connect (their
+  `_close_inspect_tabs`): closes only marker-owned chrome://inspect tabs and
+  clears the marker. Tabs the user opened themselves are never touched.
+- Guidance message is now switch-aware (their 3-way guidance): switch already
+  ticked -> "untick and re-tick" advice; not ticked -> tick advice; both add
+  the expectation note "Chrome shows ONE Allow popup per connection — it is
+  expected, not a re-ask" (their per-connection approval wording).
+
+Verified live: marker + inspect tab present -> daemon reconnect -> tab closed,
+marker cleared, log line `closed 1 leftover chrome://inspect tab(s)`.
+Tests: 31/31.

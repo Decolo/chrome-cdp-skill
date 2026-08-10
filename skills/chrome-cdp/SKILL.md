@@ -116,6 +116,10 @@ CSS px = screenshot image px / DPR
 - If Chrome runs without remote debugging, `cdp open <url>` still opens the
   tab via the system (macOS AppleScript) and prints a guide to the switch.
 - If Chrome is running but remote debugging is off, `cdp` opens
-  `chrome://inspect/#remote-debugging` once, prints a guide, and exits
+  `chrome://inspect/#remote-debugging` once (at most once per 3 minutes,
+  tracked via `~/.cache/cdp/inspect-opened`), prints a guide, and exits
   immediately (0.3s) — it never waits on you; rerun after ticking the switch
   (disable the hint with `CDP_SKIP_INSPECT_HINT=1`).
+- The `chrome://inspect` tab `cdp` opened is closed automatically on the next
+  successful connection (the daemon tracks it via the marker file) — only
+  tabs the tool itself opened are closed, never tabs you opened manually.

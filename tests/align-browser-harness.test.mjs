@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -18,6 +18,71 @@ function tempDir(t) {
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   return dir;
 }
+
+// ---------------------------------------------------------------------------
+// inspect-tab lifecycle (borrowed from browser-harness): the marker records
+// that WE opened a chrome://inspect tab; the daemon closes it on the next
+// successful connect. TTL prevents re-opening the tab on every command.
+// ---------------------------------------------------------------------------
+
+async function isolatedCdpModule(t) {
+  const dir = tempDir(t);
+  const oldXdg = process.env.XDG_RUNTIME_DIR;
+  process.env.XDG_RUNTIME_DIR = dir;
+  t.after(() => {
+    if (oldXdg === undefined) delete process.env.XDG_RUNTIME_DIR;
+    else process.env.XDG_RUNTIME_DIR = oldXdg;
+  });
+  const mod = await import(`../skills/chrome-cdp/scripts/cdp.mjs?iso=${Date.now()}-${Math.random()}`);
+  return { dir, mod };
+}
+
+test('inspectGuideDue respects TTL and skip env', async (t) => {
+  const { dir, mod } = await isolatedCdpModule(t);
+  const marker = `${dir}/cdp/inspect-opened`; // RUNTIME_DIR = XDG_RUNTIME_DIR/cdp
+  assert.equal(mod.inspectGuideDue(), true, 'no marker -> due');
+
+  writeFileSync(marker, String(Date.now()));
+  assert.equal(mod.inspectGuideDue(), false, 'fresh marker -> not due (TTL)');
+
+  const oldMtime = Date.now() - 180_000 - 1000; // INSPECT_REOPEN_TTL_MS
+  const { utimesSync } = await import('node:fs');
+  utimesSync(marker, new Date(oldMtime / 1000), new Date(oldMtime / 1000));
+  assert.equal(mod.inspectGuideDue(), true, 'stale marker -> due');
+
+  process.env.CDP_SKIP_INSPECT_HINT = '1';
+  assert.equal(mod.inspectGuideDue(), false, 'skip env -> never due');
+  delete process.env.CDP_SKIP_INSPECT_HINT;
+});
+
+test('closeInspectTabs closes only marker-owned inspect tabs and clears marker', async (t) => {
+  const { dir, mod } = await isolatedCdpModule(t);
+  const marker = `${dir}/cdp/inspect-opened`; // RUNTIME_DIR = XDG_RUNTIME_DIR/cdp
+  const closed = [];
+  const fakeCdp = {
+    send: async (method, params) => {
+      if (method === 'Target.getTargets') {
+        return {
+          targetInfos: [
+            { targetId: 'INSP', type: 'page', url: 'chrome://inspect/#remote-debugging' },
+            { targetId: 'REAL', type: 'page', url: 'https://x.com/home' },
+            { targetId: 'NTAB', type: 'page', url: 'chrome://newtab/' },
+            { targetId: 'WKR', type: 'worker', url: 'chrome://inspect/worker' },
+          ],
+        };
+      }
+      if (method === 'Target.closeTarget') closed.push(params.targetId);
+    },
+  };
+
+  await mod.closeInspectTabs(fakeCdp); // no marker -> untouched
+  assert.deepEqual(closed, [], 'no marker -> nothing closed');
+
+  writeFileSync(marker, String(Date.now()));
+  await mod.closeInspectTabs(fakeCdp);
+  assert.deepEqual(closed, ['INSP'], 'only the page-type chrome://inspect tab closed');
+  assert.equal(existsSync(marker), false, 'marker cleared after cleanup');
+});
 
 // ---------------------------------------------------------------------------
 // getPages: default view hides chrome:// pages, but open must see them so a

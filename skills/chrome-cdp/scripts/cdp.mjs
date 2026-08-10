@@ -41,6 +41,10 @@ const SPAWN_LOCK_DIR = resolve(RUNTIME_DIR, 'cdp-spawn.lock');
 const SOCKET_SELF_CHECK_MS = 5000;
 const CHROME_LAUNCH_WAIT_MS = 15000;
 const LOG_FILE = resolve(RUNTIME_DIR, 'cdp.log');
+// Marker recording that the harness opened a chrome://inspect tab (so the
+// daemon can close it later — borrowed from browser-harness inspect_marker).
+const INSPECT_MARKER = resolve(RUNTIME_DIR, 'inspect-opened');
+const INSPECT_REOPEN_TTL_MS = 180_000;
 
 // Append-only log for the CLI and the daemon (both write to the same file,
 // tagged with the process role). Useful when a command silently fails or the
@@ -255,24 +259,56 @@ function openUrlViaAppleScript(url) {
   } catch { return false; }
 }
 
-// Open the remote-debugging permission page in the user's browser.
+// Open the remote-debugging permission page in the user's browser, at most
+// once per INSPECT_REOPEN_TTL_MS (borrowed from browser-harness
+// _open_chrome_inspect_once). The marker also tells the daemon to close the
+// tab it opened once the connection is up.
+function inspectGuideDue() {
+  if (process.env.CDP_SKIP_INSPECT_HINT) return false;
+  try {
+    if (Date.now() - statSync(INSPECT_MARKER).mtimeMs < INSPECT_REOPEN_TTL_MS) return false;
+  } catch {}
+  return true;
+}
+
+function markInspectOpened() {
+  try { writeFileSync(INSPECT_MARKER, String(Date.now())); } catch {}
+}
+
 function openInspectGuide() {
-  if (process.env.CDP_SKIP_INSPECT_HINT) return;
+  if (!inspectGuideDue()) return;
   try {
     const url = 'chrome://inspect/#remote-debugging';
+    let ok = false;
     if (process.platform === 'darwin') {
       const app = process.env.CDP_CHROME_APP || 'Google Chrome';
-      spawnSync('open', ['-a', app, url], { timeout: 5000, stdio: 'ignore' });
+      ok = spawnSync('open', ['-a', app, url], { timeout: 5000, stdio: 'ignore' }).status === 0;
     }
-    else if (!IS_WINDOWS) spawnSync('xdg-open', [url], { timeout: 5000, stdio: 'ignore' });
+    else if (!IS_WINDOWS) {
+      ok = spawnSync('xdg-open', [url], { timeout: 5000, stdio: 'ignore' }).status === 0;
+    }
+    if (ok) markInspectOpened();
   } catch {}
 }
 
-const INSPECT_GUIDE_MSG =
-  '\n⚠ Chrome is running without remote debugging.\n' +
-  '  To enable it: open chrome://inspect/#remote-debugging in Chrome, tick\n' +
-  '  "Allow remote debugging", then restart Chrome and rerun this command.\n' +
-  '  (The switch is remembered; afterwards cdp works with full CDP.)\n\n';
+function inspectGuideMsg() {
+  if (localStateUserEnabled() === true) {
+    return (
+      '\n⚠ Chrome debugging is on but the CDP connection was rejected.\n' +
+      '  The "Allow remote debugging" switch is already ticked.\n' +
+      '  If Chrome did not show an "Allow debugging" popup, untick and re-tick\n' +
+      '  the switch, then restart Chrome and rerun this command.\n' +
+      '  (Chrome shows ONE "Allow debugging" popup per connection — expect it\n' +
+      '   on the next run; it is normal, not a re-ask.)\n\n'
+    );
+  }
+  return (
+    '\n⚠ Chrome is running without remote debugging.\n' +
+    '  To enable it: open chrome://inspect/#remote-debugging in Chrome, tick\n' +
+    '  "Allow remote debugging", then restart Chrome and rerun this command.\n' +
+    '  (Chrome shows ONE "Allow debugging" popup when cdp connects — expected.)\n\n'
+  );
+}
 
 // Make sure a debugging-enabled Chrome is reachable before the daemon spawns.
 // Note: Chrome 136+ refuses --remote-debugging-port on the default profile,
@@ -297,7 +333,7 @@ async function ensureChromeAvailable() {
     // Chrome is up but not debugging: guide immediately and return — the
     // command should never hang waiting for a human.
     openInspectGuide();
-    process.stderr.write(INSPECT_GUIDE_MSG);
+    process.stderr.write(inspectGuideMsg());
     return false;
   }
 
@@ -309,7 +345,7 @@ async function ensureChromeAvailable() {
   log('cli', 'ensureChromeAvailable: launchChrome=', launched);
   if (!launched) {
     openInspectGuide();
-    process.stderr.write(INSPECT_GUIDE_MSG);
+    process.stderr.write(inspectGuideMsg());
     return false;
   }
   const ready = !!(await waitForDevToolsActivePort(CHROME_LAUNCH_WAIT_MS));
@@ -317,9 +353,29 @@ async function ensureChromeAvailable() {
       'userEnabled=', localStateUserEnabled());
   if (!ready) {
     openInspectGuide();
-    process.stderr.write(INSPECT_GUIDE_MSG);
+    process.stderr.write(inspectGuideMsg());
   }
   return ready;
+}
+
+// Close chrome://inspect tabs this tool opened (marked by INSPECT_MARKER) —
+// borrowed from browser-harness _close_inspect_tabs. Tabs the user opened
+// themselves are never touched (no marker -> no cleanup).
+async function closeInspectTabs(cdp) {
+  try {
+    if (!existsSync(INSPECT_MARKER)) return;
+    const { targetInfos } = await cdp.send('Target.getTargets');
+    let closed = 0;
+    for (const t of targetInfos) {
+      if (t.type === 'page' && (t.url || '').startsWith('chrome://inspect')) {
+        try { await cdp.send('Target.closeTarget', { targetId: t.targetId }); closed++; } catch {}
+      }
+    }
+    unlinkSync(INSPECT_MARKER);
+    if (closed) log('daemon', `closed ${closed} leftover chrome://inspect tab(s)`);
+  } catch (e) {
+    log('daemon', 'closeInspectTabs:', e.message);
+  }
 }
 
 // Reusable blank tab for `open`: about:blank / new-tab pages only; real pages
@@ -1269,6 +1325,7 @@ async function runBrowserDaemon() {
       await cdp.connect(getWsUrl());
       connected = true;
       log('daemon', `connected to Chrome (attempt ${attempt})`);
+      await closeInspectTabs(cdp);
     } catch (e) {
       log('daemon', `connect attempt ${attempt} FAILED:`, e.message);
       if (attempt < 3) await sleep(2000);
@@ -2179,6 +2236,9 @@ export {
   findReusableTab,
   localStateUserEnabled,
   getPages,
+  inspectGuideDue,
+  markInspectOpened,
+  closeInspectTabs,
 };
 
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
