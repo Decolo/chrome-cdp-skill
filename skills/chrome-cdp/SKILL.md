@@ -102,7 +102,7 @@ CSS px = screenshot image px / DPR
 - Prefer one combined `eval` over many small `eval` calls when collecting structured page data.
 - Use `net --same-origin` or `--type` before broad resource listings when you only need one slice.
 - Use `stats` to spot commands that are setup-heavy or return unusually large payloads, not just slow ones.
-- Chrome shows an "Allow debugging" modal once per Chrome session. A background browser daemon keeps the CDP connection alive so subsequent commands need no further approval until Chrome disconnects or you run `stop`.
+- Chrome shows an "Allow debugging" modal once per Chrome session. A background browser daemon keeps the CDP connection alive so subsequent commands need no further approval until Chrome disconnects or you run `stop`. Each daemon start makes exactly ONE connection attempt (20s window) — one popup, click it, done; cdp never reconnects inside a daemon lifetime, so popups can't pile up.
 - If Chrome is not running at all, `cdp` launches it automatically with the
   last-used profile — no manual start needed. Chrome 136+ ignores
   `--remote-debugging-port` on the default profile, so debugging comes from

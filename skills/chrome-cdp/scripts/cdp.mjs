@@ -1315,24 +1315,19 @@ async function runBrowserDaemon() {
 
   const cdp = new CDP();
   log('daemon', 'starting, pid=', process.pid, 'socket=', sp);
-  // Patient connection: Chrome may still be warming up (fresh launch, remote
-  // debugging switch just enabled, per-attach permission flow). Retry a few
-  // times with a per-attempt timeout before giving up — mirrors browser-harness
-  // _PatientCDPClient.
-  let connected = false;
-  for (let attempt = 1; attempt <= 3 && !connected; attempt++) {
-    try {
-      await cdp.connect(getWsUrl());
-      connected = true;
-      log('daemon', `connected to Chrome (attempt ${attempt})`);
-      await closeInspectTabs(cdp);
-    } catch (e) {
-      log('daemon', `connect attempt ${attempt} FAILED:`, e.message);
-      if (attempt < 3) await sleep(2000);
-    }
-  }
-  if (!connected) {
+  // Patient connection, mirroring browser-harness _PatientCDPClient: ONE
+  // connection attempt stretched to a long timeout (theirs: 45s). Chrome 144+
+  // shows an "Allow debugging" popup per NEW WebSocket connection — retrying
+  // with fresh connections piles up popups (each attempt re-prompts), so we
+  // never reconnect inside a daemon lifetime. The CLI waits ~30s for the
+  // socket; click Allow within that window and the daemon comes up.
+  try {
+    await cdp.connect(getWsUrl(), 20000);
+    log('daemon', 'connected to Chrome');
+    await closeInspectTabs(cdp);
+  } catch (e) {
     releaseDaemonPidLock();
+    log('daemon', 'connect FAILED (single attempt):', e.message);
     process.stderr.write('Browser daemon: cannot connect to Chrome\n');
     process.exit(1);
   }

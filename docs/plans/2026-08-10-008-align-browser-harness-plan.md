@@ -167,3 +167,21 @@ Borrowed their whole permission-tab lifecycle to reduce Allow-popup friction:
 Verified live: marker + inspect tab present -> daemon reconnect -> tab closed,
 marker cleared, log line `closed 1 leftover chrome://inspect tab(s)`.
 Tests: 31/31.
+
+## Addendum 4: one connection per daemon lifetime — no popup pile-up (2026-08-10)
+
+User reported clicking "Allow debugging" many times. Root cause: our
+"patient connect" retried with FRESH WebSocket connections (3 x 8s), and
+Chrome 144+ shows an Allow popup per NEW connection — each retry re-prompted.
+
+browser-harness's _PatientCDPClient is actually ONE `websockets.connect`
+stretched to a 45s open timeout — patient means wait, not reconnect. Aligned:
+
+- daemon now makes exactly ONE connection attempt with a 20s timeout;
+  on failure it exits and the CLI tells the user to click Allow and rerun
+  (no perm-retry loops, mirroring their admin flow).
+- Result: one daemon lifetime = one popup. Click once, daemon holds the
+  connection, no further approval until stop/Chrome disconnect.
+
+Verified live: stop -> list -> single "daemon connected to Chrome" log line,
+no attempt retries. Tests: 31/31.
