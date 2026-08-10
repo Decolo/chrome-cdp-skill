@@ -109,10 +109,13 @@ CSS px = screenshot image px / DPR
   Chrome's own "Allow remote debugging" switch (chrome://inspect, remembered
   in Local State): tick it once, restart Chrome, and every future launch opens
   the DevTools port automatically. Override the binary with
-  `CDP_CHROME_PATH`/`CHROME_PATH`; a custom `CDP_USER_DATA_DIR` restores the
-  command-line debug flag (Chrome for Testing, isolated instances).
+  `CDP_CHROME_PATH`/`CHROME_PATH`; on macOS `CDP_CHROME_APP` overrides the
+  app name used to launch and to open tabs via AppleScript; a custom
+  `CDP_USER_DATA_DIR` restores the command-line debug flag (Chrome for
+  Testing, isolated instances).
 - If Chrome runs without remote debugging, `cdp open <url>` still opens the
   tab via the system (macOS AppleScript) and prints a guide to the switch.
 - If Chrome is running but remote debugging is off, `cdp` opens
-  `chrome://inspect/#remote-debugging` once and waits briefly for you to tick
-  "Allow remote debugging" (disable the hint with `CDP_SKIP_INSPECT_HINT=1`).
+  `chrome://inspect/#remote-debugging` once, prints a guide, and exits
+  immediately (0.3s) — it never waits on you; rerun after ticking the switch
+  (disable the hint with `CDP_SKIP_INSPECT_HINT=1`).

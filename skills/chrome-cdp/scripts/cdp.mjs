@@ -17,7 +17,7 @@ import net from 'net';
 
 const TIMEOUT = 15000;
 const NAVIGATION_TIMEOUT = 30000;
-const DAEMON_CONNECT_RETRIES = 70;
+const DAEMON_CONNECT_RETRIES = 100;
 const DAEMON_CONNECT_DELAY = 300;
 const MIN_TARGET_PREFIX_LEN = 8;
 const COMMAND_HISTORY_LIMIT = 50;
@@ -206,8 +206,9 @@ function launchChrome() {
       const bin = resolve(raw);
       if (existsSync(bin)) {
         try {
-          spawn(bin, chromeLaunchArgs(), { detached: true, stdio: 'ignore' }).unref();
-          log('cli', 'launchChrome: env-path', bin, chromeLaunchArgs().join(' '));
+          const args = chromeLaunchArgs();
+          spawn(bin, args, { detached: true, stdio: 'ignore' }).unref();
+          log('cli', 'launchChrome: env-path', bin, args.join(' '));
           return true;
         } catch { continue; }
       }
@@ -215,16 +216,18 @@ function launchChrome() {
   }
   if (IS_WINDOWS) {
     try {
-      spawn('cmd', ['/c', 'start', '', 'chrome', ...chromeLaunchArgs()], { detached: true, stdio: 'ignore' }).unref();
-      log('cli', 'launchChrome: windows start', chromeLaunchArgs().join(' '));
+      const wargs = chromeLaunchArgs();
+      spawn('cmd', ['/c', 'start', '', 'chrome', ...wargs], { detached: true, stdio: 'ignore' }).unref();
+      log('cli', 'launchChrome: windows start', wargs.join(' '));
       return true;
     } catch { return false; }
   }
   if (process.platform === 'darwin') {
     const app = process.env.CDP_CHROME_APP || 'Google Chrome';
     try {
-      const r = spawnSync('open', ['-a', app, '--args', ...chromeLaunchArgs()], { timeout: 10000, stdio: 'ignore' });
-      log('cli', 'launchChrome: open -a', app, chromeLaunchArgs().join(' '), 'status=', r.status);
+      const margs = chromeLaunchArgs();
+      const r = spawnSync('open', ['-a', app, '--args', ...margs], { timeout: 10000, stdio: 'ignore' });
+      log('cli', 'launchChrome: open -a', app, margs.join(' '), 'status=', r.status);
       return r.status === 0;
     } catch { return false; }
   }
@@ -257,7 +260,10 @@ function openInspectGuide() {
   if (process.env.CDP_SKIP_INSPECT_HINT) return;
   try {
     const url = 'chrome://inspect/#remote-debugging';
-    if (process.platform === 'darwin') spawnSync('open', ['-a', process.env.CDP_CHROME_APP || 'Google Chrome', url], { timeout: 5000, stdio: 'ignore' });
+    if (process.platform === 'darwin') {
+      const app = process.env.CDP_CHROME_APP || 'Google Chrome';
+      spawnSync('open', ['-a', app, url], { timeout: 5000, stdio: 'ignore' });
+    }
     else if (!IS_WINDOWS) spawnSync('xdg-open', [url], { timeout: 5000, stdio: 'ignore' });
   } catch {}
 }
@@ -323,8 +329,7 @@ function findReusableTab(pages) {
   const u = (p) => (p && typeof p.url === 'string' ? p.url : '');
   return pages.find(p =>
     u(p) === 'about:blank' || u(p).startsWith('about:blank#') ||
-    u(p).startsWith('chrome://newtab') || u(p).startsWith('edge://newtab') ||
-    u(p).startsWith('about:newtab'),
+    u(p).startsWith('chrome://newtab') || u(p).startsWith('edge://newtab')
   ) || null;
 }
 
@@ -556,9 +561,10 @@ class CDP {
         try { this.#ws.close(); } catch {}
         rej(new Error('CDP connect timeout'));
       }, timeoutMs);
-      this.#ws.onopen = () => { clearTimeout(timer); res(); };
-      this.#ws.onerror = (e) => rej(new Error('WebSocket error: ' + (e.message || e.type)));
-      this.#ws.onclose = () => this.#closeHandlers.forEach(h => h());
+      const done = () => clearTimeout(timer);
+      this.#ws.onopen = () => { done(); res(); };
+      this.#ws.onerror = (e) => { done(); rej(new Error('WebSocket error: ' + (e.message || e.type))); };
+      this.#ws.onclose = () => { done(); this.#closeHandlers.forEach(h => h()); };
       this.#ws.onmessage = (ev) => {
         const msg = JSON.parse(ev.data);
         if (msg.id && this.#pending.has(msg.id)) {
@@ -1869,7 +1875,7 @@ async function getOrStartBrowserDaemon() {
     if (!(await ensureChromeAvailable())) {
       throw new Error(
         'Browser daemon failed to start — no debugging-enabled Chrome is available. ' +
-        'See chrome://inspect/#remote-debugging or run "cdp --doctor".',
+        'See chrome://inspect/#remote-debugging — tick "Allow remote debugging", restart Chrome, then rerun.',
       );
     }
 
@@ -1995,7 +2001,7 @@ Usage: cdp <command> [args]
                                     Optional interval in ms between clicks (default 1500)
   evalraw <target> <method> [json]  Send a raw CDP command; returns JSON result
                                     e.g. evalraw <t> "DOM.getDocument" '{}'
-  open  [url]                       Open a new tab (default: about:blank)
+  open  [url]                       Open url in a blank tab if one exists (reused), else a new tab (default: about:blank)
   stop                              Stop the browser daemon
 
 <target> is a unique targetId prefix from "cdp list". If a prefix is ambiguous,
@@ -2037,7 +2043,7 @@ const NEEDS_TARGET = new Set([
 
 async function main() {
   const [cmd, ...args] = process.argv.slice(2);
-  log('cli', 'command:', cmd, args.slice(0, 2).map(a => (a || '').length > 80 ? a.slice(0, 80) + '…' : a).join(' '));
+  log(cmd === '_browser_daemon' ? 'daemon' : 'cli', 'command:', cmd, args.slice(0, 2).map(a => (a || '').length > 80 ? a.slice(0, 80) + '…' : a).join(' '));
 
   // Daemon mode (internal)
   if (cmd === '_browser_daemon') { await runBrowserDaemon(); return; }

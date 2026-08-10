@@ -127,3 +127,23 @@ Verified end-to-end with Chrome fully closed: `cdp open <url>` -> Chrome
 auto-launches (no debug flag) -> switch opens the port in ~1s -> daemon
 connects (attempt 1) -> tab opens via CDP. Total 4.3s. `eval` works on the
 opened tab. Tests: 28/28.
+
+## Addendum 2: post-review fixes (2026-08-10)
+
+Subagent review (Standards + Spec axes) findings fixed in one commit:
+
+- CDP.connect timeout timer now cleared on error/close too — a fast-fail
+  attempt previously left a stale timer that aborted the next retry's socket
+  (real bug).
+- Removed the nonexistent `cdp --doctor` reference from the failure message.
+- CLI daemon-poll window raised 21s -> 30s so it covers the patient connect's
+  worst case (3x8s attempts + 2x2s gaps = 28s).
+- `findReusableTab` no longer matches `about:newtab` (Firefox-only scheme,
+  unreachable in Chrome; the original plan listed only about:blank /
+  chrome://newtab / edge://newtab).
+- AppleScript fallback now honors `CDP_CHROME_APP`; SKILL.md documents it.
+- SKILL.md wording fixed (no waiting for the switch — immediate exit);
+  USAGE line for `open` updated; daemon-command log tag corrected.
+- launchChrome parses launch args once instead of per-branch.
+- Tests: 29/29. Daemon response gained additive `reusedTab`/`text` fields
+  (CLI protocol backward-compatible).
