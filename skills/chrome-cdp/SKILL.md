@@ -77,7 +77,9 @@ scripts/cdp.mjs clickxy <target> <x> <y>       # click at CSS pixel coords
 scripts/cdp.mjs type    <target> <text>         # Input.insertText at current focus; works in cross-origin iframes unlike eval
 scripts/cdp.mjs loadall <target> <selector> [ms]  # click "load more" until gone (default 1500ms between clicks)
 scripts/cdp.mjs evalraw <target> <method> [json]  # raw CDP command passthrough
-scripts/cdp.mjs open    [url]                  # open new tab via the browser daemon
+scripts/cdp.mjs open    [url]                  # open url in a blank tab if one exists (reused), else a new tab
+scripts/cdp.mjs list                              # reuses the single browser daemon; auto-launches
+                                                    Chrome with remote debugging if it is not running
 scripts/cdp.mjs stats                          # daemon health and recent command timings
 scripts/cdp.mjs stop                           # stop the browser daemon
 ```
@@ -101,3 +103,16 @@ CSS px = screenshot image px / DPR
 - Use `net --same-origin` or `--type` before broad resource listings when you only need one slice.
 - Use `stats` to spot commands that are setup-heavy or return unusually large payloads, not just slow ones.
 - Chrome shows an "Allow debugging" modal once per Chrome session. A background browser daemon keeps the CDP connection alive so subsequent commands need no further approval until Chrome disconnects or you run `stop`.
+- If Chrome is not running at all, `cdp` launches it automatically with the
+  last-used profile — no manual start needed. Chrome 136+ ignores
+  `--remote-debugging-port` on the default profile, so debugging comes from
+  Chrome's own "Allow remote debugging" switch (chrome://inspect, remembered
+  in Local State): tick it once, restart Chrome, and every future launch opens
+  the DevTools port automatically. Override the binary with
+  `CDP_CHROME_PATH`/`CHROME_PATH`; a custom `CDP_USER_DATA_DIR` restores the
+  command-line debug flag (Chrome for Testing, isolated instances).
+- If Chrome runs without remote debugging, `cdp open <url>` still opens the
+  tab via the system (macOS AppleScript) and prints a guide to the switch.
+- If Chrome is running but remote debugging is off, `cdp` opens
+  `chrome://inspect/#remote-debugging` once and waits briefly for you to tick
+  "Allow remote debugging" (disable the hint with `CDP_SKIP_INSPECT_HINT=1`).

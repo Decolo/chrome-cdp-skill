@@ -48,6 +48,7 @@ test('CDP.send clears its timeout timer when the response arrives', async (t) =>
   const connecting = cdp.connect('ws://fake');
   fake._open();
   await connecting;
+  timers.length = 0; // connect's own timeout timer was already cleared
 
   // Respond immediately on send.
   const origSend = fake.send.bind(fake);
@@ -74,6 +75,7 @@ test('CDP.send rejects on timeout and leaves no pending state behind', async (t)
   const connecting = cdp.connect('ws://fake');
   fake._open();
   await connecting;
+  timers.length = 0; // connect's own timeout timer was already cleared
 
   const p = cdp.send('Test.hang'); // no response ever arrives
   assert.equal(timers.length, 1);

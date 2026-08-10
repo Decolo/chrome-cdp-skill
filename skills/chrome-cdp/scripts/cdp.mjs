@@ -8,16 +8,16 @@
 // modal fires once per daemon (= once per Chrome session). Daemon lives
 // until Chrome disconnects or "cdp stop" is called.
 
-import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync, openSync, writeSync, closeSync, statSync, rmdirSync } from 'fs';
+import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync, openSync, writeSync, closeSync, statSync, rmdirSync, appendFileSync } from 'fs';
 import { homedir } from 'os';
 import { resolve } from 'path';
 import { pathToFileURL } from 'url';
-import { spawn } from 'child_process';
+import { spawn, spawnSync, execFileSync } from 'child_process';
 import net from 'net';
 
 const TIMEOUT = 15000;
 const NAVIGATION_TIMEOUT = 30000;
-const DAEMON_CONNECT_RETRIES = 20;
+const DAEMON_CONNECT_RETRIES = 70;
 const DAEMON_CONNECT_DELAY = 300;
 const MIN_TARGET_PREFIX_LEN = 8;
 const COMMAND_HISTORY_LIMIT = 50;
@@ -39,8 +39,19 @@ const BROWSER_SOCK = IS_WINDOWS
 const DAEMON_PID_FILE = resolve(RUNTIME_DIR, 'cdp-browser.pid');
 const SPAWN_LOCK_DIR = resolve(RUNTIME_DIR, 'cdp-spawn.lock');
 const SOCKET_SELF_CHECK_MS = 5000;
+const CHROME_LAUNCH_WAIT_MS = 15000;
+const LOG_FILE = resolve(RUNTIME_DIR, 'cdp.log');
 
-function getWsUrl() {
+// Append-only log for the CLI and the daemon (both write to the same file,
+// tagged with the process role). Useful when a command silently fails or the
+// daemon dies: everything leading up to it is on disk.
+function log(role, ...parts) {
+  try {
+    appendFileSync(LOG_FILE, `[${new Date().toISOString()}] ${role} ${parts.join(' ')}\n`);
+  } catch {}
+}
+
+function devToolsPortCandidates() {
   const home = homedir();
   // macOS: ~/Library/Application Support/<name>/DevToolsActivePort
   const macBrowsers = [
@@ -61,7 +72,7 @@ function getWsUrl() {
     ['com.microsoft.Edge', 'microsoft-edge'],
     ['com.vivaldi.Vivaldi', 'vivaldi'],
   ];
-  const candidates = [
+  return [
     process.env.CDP_PORT_FILE,
     ...macBrowsers.flatMap(b => [
       resolve(home, 'Library/Application Support', b, 'DevToolsActivePort'),
@@ -84,7 +95,241 @@ function getWsUrl() {
       ];
     }) : []),
   ].filter(Boolean);
-  const portFile = candidates.find(p => existsSync(p));
+}
+
+function findDevToolsActivePortFile() {
+  return devToolsPortCandidates().find(p => existsSync(p)) || null;
+}
+
+// True when the file exists AND something is actually listening on its port
+// (a stale DevToolsActivePort from a dead Chrome must not be trusted).
+async function devToolsPortLive(filePath) {
+  if (!filePath) return false;
+  try {
+    const lines = readFileSync(filePath, 'utf8').trim().split('\n');
+    const port = Number.parseInt(lines[0], 10);
+    if (!Number.isInteger(port) || port <= 0 || port > 65535) return false;
+    return await new Promise((resolvePort) => {
+      const s = net.connect(port, process.env.CDP_HOST || '127.0.0.1');
+      s.setTimeout(300, () => { s.destroy(); resolvePort(false); });
+      s.on('connect', () => { s.destroy(); resolvePort(true); });
+      s.on('error', () => resolvePort(false));
+    });
+  } catch { return false; }
+}
+
+async function waitForDevToolsActivePort(timeoutMs = CHROME_LAUNCH_WAIT_MS) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const f = findDevToolsActivePortFile();
+    if (f && await devToolsPortLive(f)) return f;
+    await sleep(250);
+  }
+  return null;
+}
+
+// Cross-platform check for a RUNNING MAIN browser process (exact process-name
+// match, not substring: Chrome's helper processes are named "Google Chrome
+// Helper" and must NOT count as "the browser is running", or the auto-launch
+// path would never trigger right after Chrome quits).
+function isBrowserProcessRunning() {
+  const targets = IS_WINDOWS
+    ? ['chrome.exe', 'msedge.exe', 'brave.exe', 'vivaldi.exe']
+    : ['Google Chrome', 'google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser', 'brave', 'brave-browser', 'microsoft-edge', 'vivaldi'];
+  for (const t of targets) {
+    try {
+      const out = IS_WINDOWS
+        ? execFileSync('tasklist', ['/FI', `IMAGENAME eq ${t}`], { timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] }).toString()
+        : execFileSync('pgrep', ['-x', t], { timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] }).toString();
+      if (out.trim()) return true;
+    } catch {}
+  }
+  return false;
+}
+
+// Last-used profile from Chrome's Local State, so a relaunch skips the profile
+// picker and lands in the user's normal session (browser-harness trick).
+function resolveLastUsedProfile(baseDir) {
+  if (!baseDir) return null;
+  try {
+    const state = JSON.parse(readFileSync(resolve(baseDir, 'Local State'), 'utf8'));
+    const last = (state.profile || {}).last_used || 'Default';
+    if (typeof last === 'string' && existsSync(resolve(baseDir, last))) return last;
+  } catch {}
+  return null;
+}
+
+function defaultProfileBase() {
+  const home = homedir();
+  if (IS_WINDOWS) return resolve(process.env.LOCALAPPDATA || resolve(home, 'AppData/Local'), 'Google/Chrome/User Data');
+  if (process.platform === 'darwin') return resolve(home, 'Library/Application Support/Google/Chrome');
+  return resolve(home, '.config/google-chrome');
+}
+
+// Launch args for Chrome. Chrome 136+ IGNORES --remote-debugging-port on the
+// default profile (security change); the only reliable path there is Chrome's
+// own "Allow remote debugging" switch, remembered in Local State
+// (devtools.remote_debugging.user-enabled) and honored on every start — so we
+// pass NO debug flag on the default profile (browser-harness does the same).
+// The flag still works with a custom --user-data-dir (Chrome for Testing,
+// isolated instances), so it is kept for that case.
+function chromeLaunchArgs() {
+  const dataDir = (process.env.CDP_USER_DATA_DIR || '').trim();
+  const args = [];
+  if (dataDir) {
+    args.push('--remote-debugging-port=0', `--user-data-dir=${dataDir}`);
+  } else {
+    const last = resolveLastUsedProfile(defaultProfileBase());
+    if (last) args.push(`--profile-directory=${last}`);
+  }
+  return args;
+}
+
+// chrome://inspect's "Allow remote debugging" switch, as recorded by Chrome in
+// Local State (devtools.remote_debugging.user-enabled). True -> Chrome will
+// open its DevTools port automatically on the next start.
+function localStateUserEnabled(baseDir = defaultProfileBase()) {
+  if (!baseDir) return null;
+  try {
+    const state = JSON.parse(readFileSync(resolve(baseDir, 'Local State'), 'utf8'));
+    const enabled = (state.devtools || {}).remote_debugging?.['user-enabled'];
+    return enabled === true ? true : enabled === false ? false : null;
+  } catch { return null; }
+}
+
+// Launch the user's Chrome with remote debugging on. Returns true when the
+// launch command was dispatched (not when Chrome is actually ready).
+function launchChrome() {
+  for (const key of ['CDP_CHROME_PATH', 'CHROME_PATH']) {
+    const raw = (process.env[key] || '').trim();
+    if (raw) {
+      const bin = resolve(raw);
+      if (existsSync(bin)) {
+        try {
+          spawn(bin, chromeLaunchArgs(), { detached: true, stdio: 'ignore' }).unref();
+          log('cli', 'launchChrome: env-path', bin, chromeLaunchArgs().join(' '));
+          return true;
+        } catch { continue; }
+      }
+    }
+  }
+  if (IS_WINDOWS) {
+    try {
+      spawn('cmd', ['/c', 'start', '', 'chrome', ...chromeLaunchArgs()], { detached: true, stdio: 'ignore' }).unref();
+      log('cli', 'launchChrome: windows start', chromeLaunchArgs().join(' '));
+      return true;
+    } catch { return false; }
+  }
+  if (process.platform === 'darwin') {
+    const app = process.env.CDP_CHROME_APP || 'Google Chrome';
+    try {
+      const r = spawnSync('open', ['-a', app, '--args', ...chromeLaunchArgs()], { timeout: 10000, stdio: 'ignore' });
+      log('cli', 'launchChrome: open -a', app, chromeLaunchArgs().join(' '), 'status=', r.status);
+      return r.status === 0;
+    } catch { return false; }
+  }
+  for (const cmd of ['google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser', 'brave-browser', 'microsoft-edge', 'vivaldi']) {
+    try {
+      const w = spawnSync('which', [cmd], { timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] });
+      if (w.status === 0) {
+        const bin = w.stdout.toString().trim().split('\n')[0];
+        if (bin) { spawn(bin, chromeLaunchArgs(), { detached: true, stdio: 'ignore' }).unref(); return true; }
+      }
+    } catch {}
+  }
+  return false;
+}
+
+// macOS fallback: open a URL in Chrome via AppleScript when CDP is not
+// available (Chrome running without remote debugging). Launches Chrome first
+// if it is not running, so "open a tab" works without any debugging setup.
+function openUrlViaAppleScript(url) {
+  try {
+    const safe = url.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    const script = `tell application "Google Chrome"\n  open location "${safe}"\n  activate\nend tell`;
+    const r = spawnSync('osascript', ['-e', script], { timeout: 8000, stdio: 'ignore' });
+    return r.status === 0;
+  } catch { return false; }
+}
+
+// Open the remote-debugging permission page in the user's browser.
+function openInspectGuide() {
+  if (process.env.CDP_SKIP_INSPECT_HINT) return;
+  try {
+    const url = 'chrome://inspect/#remote-debugging';
+    if (process.platform === 'darwin') spawnSync('open', ['-a', process.env.CDP_CHROME_APP || 'Google Chrome', url], { timeout: 5000, stdio: 'ignore' });
+    else if (!IS_WINDOWS) spawnSync('xdg-open', [url], { timeout: 5000, stdio: 'ignore' });
+  } catch {}
+}
+
+const INSPECT_GUIDE_MSG =
+  '\n⚠ Chrome is running without remote debugging.\n' +
+  '  To enable it: open chrome://inspect/#remote-debugging in Chrome, tick\n' +
+  '  "Allow remote debugging", then restart Chrome and rerun this command.\n' +
+  '  (The switch is remembered; afterwards cdp works with full CDP.)\n\n';
+
+// Make sure a debugging-enabled Chrome is reachable before the daemon spawns.
+// Note: Chrome 136+ refuses --remote-debugging-port on the default profile,
+// so the only reliable path is the chrome://inspect "Allow remote debugging"
+// switch (one-time, remembered by Chrome). We therefore:
+//   1. accept a live DevToolsActivePort if present        -> ok
+//   2. otherwise launch Chrome (or just guide if running)
+//      with a short window for the launch args to work (Chrome for Testing,
+//      older Chromium, --user-data-dir setups still honor them)
+//   3. if no port after ~8s, open chrome://inspect and wait up to 60s for
+//      the user to tick the switch and let Chrome restart
+async function ensureChromeAvailable() {
+  const f = findDevToolsActivePortFile();
+  const portLive = f && await devToolsPortLive(f);
+  log('cli', 'ensureChromeAvailable: portFile=', f, 'portLive=', portLive);
+  if (portLive) return true;
+
+  const browserRunning = isBrowserProcessRunning();
+  log('cli', 'ensureChromeAvailable: browserRunning=', browserRunning);
+
+  if (browserRunning) {
+    // Chrome is up but not debugging: guide immediately and return — the
+    // command should never hang waiting for a human.
+    openInspectGuide();
+    process.stderr.write(INSPECT_GUIDE_MSG);
+    return false;
+  }
+
+  // Chrome not running: launch it and wait for the DevTools port to appear.
+  // With the "Allow remote debugging" switch on (Local State), a plain launch
+  // opens the port automatically; without the switch, Chrome 136+ will never
+  // open one, so after the cold-start window we guide the user instead.
+  const launched = launchChrome();
+  log('cli', 'ensureChromeAvailable: launchChrome=', launched);
+  if (!launched) {
+    openInspectGuide();
+    process.stderr.write(INSPECT_GUIDE_MSG);
+    return false;
+  }
+  const ready = !!(await waitForDevToolsActivePort(CHROME_LAUNCH_WAIT_MS));
+  log('cli', 'ensureChromeAvailable: launch-wait result=', ready,
+      'userEnabled=', localStateUserEnabled());
+  if (!ready) {
+    openInspectGuide();
+    process.stderr.write(INSPECT_GUIDE_MSG);
+  }
+  return ready;
+}
+
+// Reusable blank tab for `open`: about:blank / new-tab pages only; real pages
+// (user's tabs) are never touched.
+function findReusableTab(pages) {
+  if (!Array.isArray(pages)) return null;
+  const u = (p) => (p && typeof p.url === 'string' ? p.url : '');
+  return pages.find(p =>
+    u(p) === 'about:blank' || u(p).startsWith('about:blank#') ||
+    u(p).startsWith('chrome://newtab') || u(p).startsWith('edge://newtab') ||
+    u(p).startsWith('about:newtab'),
+  ) || null;
+}
+
+function getWsUrl() {
+  const portFile = findDevToolsActivePortFile();
   if (!portFile) throw new Error('No DevToolsActivePort found. Enable remote debugging at chrome://inspect/#remote-debugging');
   const lines = readFileSync(portFile, 'utf8').trim().split('\n');
   if (lines.length < 2 || !lines[0] || !lines[1]) throw new Error(`Invalid DevToolsActivePort file: ${portFile}`);
@@ -304,10 +549,14 @@ function parseNetArgs(args) {
 class CDP {
   #ws; #id = 0; #pending = new Map(); #eventHandlers = new Map(); #closeHandlers = [];
 
-  async connect(wsUrl) {
+  async connect(wsUrl, timeoutMs = 8000) {
     return new Promise((res, rej) => {
       this.#ws = new WebSocket(wsUrl);
-      this.#ws.onopen = () => res();
+      const timer = setTimeout(() => {
+        try { this.#ws.close(); } catch {}
+        rej(new Error('CDP connect timeout'));
+      }, timeoutMs);
+      this.#ws.onopen = () => { clearTimeout(timer); res(); };
       this.#ws.onerror = (e) => rej(new Error('WebSocket error: ' + (e.message || e.type)));
       this.#ws.onclose = () => this.#closeHandlers.forEach(h => h());
       this.#ws.onmessage = (ev) => {
@@ -1003,11 +1252,25 @@ async function runBrowserDaemon() {
   }
 
   const cdp = new CDP();
-  try {
-    await cdp.connect(getWsUrl());
-  } catch (e) {
+  log('daemon', 'starting, pid=', process.pid, 'socket=', sp);
+  // Patient connection: Chrome may still be warming up (fresh launch, remote
+  // debugging switch just enabled, per-attach permission flow). Retry a few
+  // times with a per-attempt timeout before giving up — mirrors browser-harness
+  // _PatientCDPClient.
+  let connected = false;
+  for (let attempt = 1; attempt <= 3 && !connected; attempt++) {
+    try {
+      await cdp.connect(getWsUrl());
+      connected = true;
+      log('daemon', `connected to Chrome (attempt ${attempt})`);
+    } catch (e) {
+      log('daemon', `connect attempt ${attempt} FAILED:`, e.message);
+      if (attempt < 3) await sleep(2000);
+    }
+  }
+  if (!connected) {
     releaseDaemonPidLock();
-    process.stderr.write(`Browser daemon: cannot connect to Chrome: ${e.message}\n`);
+    process.stderr.write('Browser daemon: cannot connect to Chrome\n');
     process.exit(1);
   }
 
@@ -1164,6 +1427,7 @@ async function runBrowserDaemon() {
   function shutdown() {
     if (!alive) return;
     alive = false;
+    log('daemon', 'shutdown');
     server.close();
     if (!IS_WINDOWS) try { unlinkSync(sp); } catch {}
     releaseDaemonPidLock();
@@ -1287,7 +1551,20 @@ async function runBrowserDaemon() {
         }
         case 'open': {
           const url = args[0] || 'about:blank';
-          const { targetId } = await cdp.send('Target.createTarget', { url });
+          // Reuse a blank tab (about:blank / new-tab page) when one exists —
+          // never touch the user's real tabs.
+          const { pages: tabsBefore } = await getPagesCached(true);
+          const reusable = findReusableTab(tabsBefore);
+          let targetId;
+          if (reusable) {
+            targetId = reusable.targetId;
+            await cdp.send('Target.activateTarget', { targetId });
+            const { sessionId } = await getSession(targetId);
+            await cdp.send('Page.enable', {}, sessionId);
+            await cdp.send('Page.navigate', { url }, sessionId);
+          } else {
+            ({ targetId } = await cdp.send('Target.createTarget', { url }));
+          }
           const pageListStarted = Date.now();
           const { pages } = await getPagesCached(true);
           trace.pageListMs = Date.now() - pageListStarted;
@@ -1296,7 +1573,15 @@ async function runBrowserDaemon() {
             pages.push({ targetId, title: url, url });
             cachePages(pages, 'reuse');
           }
-          result = JSON.stringify({ targetId, pages });
+          trace.reusedTab = !!reusable;
+          result = JSON.stringify({
+            targetId,
+            pages,
+            reusedTab: !!reusable,
+            text: reusable
+              ? `Reused blank tab: ${targetId}  ${url}`
+              : `Opened new tab: ${targetId}  ${url}`,
+          });
           break;
         }
         case 'stop': return { ok: true, result: '', stopAfter: true };
@@ -1534,7 +1819,11 @@ function connectToSocket(sp) {
 
 async function getOrStartBrowserDaemon() {
   // 1) Fast path: the single daemon's socket is already there.
-  try { return await connectToSocket(BROWSER_SOCK); } catch {}
+  try {
+    const conn = await connectToSocket(BROWSER_SOCK);
+    log('cli', 'daemon: socket fast-path hit');
+    return conn;
+  } catch {}
 
   // 2) A daemon process may be alive but its socket file missing (e.g. it was
   //    unlinked while the daemon still runs). Wait briefly for it to recover
@@ -1556,6 +1845,7 @@ async function getOrStartBrowserDaemon() {
   //    the others wait for its socket.
   if (existingPid != null) releaseDaemonPidLock();
   if (!IS_WINDOWS) try { unlinkSync(BROWSER_SOCK); } catch {}
+  log('cli', 'daemon: stale pid/socket cleared, racing for spawn lock');
 
   if (!tryAcquireSpawnLock()) {
     // Another CLI is already spawning: wait for its daemon's socket.
@@ -1570,12 +1860,24 @@ async function getOrStartBrowserDaemon() {
     // path earlier, or another CLI just released it).
     try { return await connectToSocket(BROWSER_SOCK); } catch {}
 
+    // Make sure a debugging-enabled Chrome is reachable before spawning the
+    // daemon: auto-launch Chrome if it is not running, or guide the user to
+    // tick remote debugging if it is running without it.
+    log('cli', 'daemon: won spawn lock, ensuring Chrome availability');
+    if (!(await ensureChromeAvailable())) {
+      throw new Error(
+        'Browser daemon failed to start — no debugging-enabled Chrome is available. ' +
+        'See chrome://inspect/#remote-debugging or run "cdp --doctor".',
+      );
+    }
+
     // Spawn daemon
     const child = spawn(process.execPath, [process.argv[1], '_browser_daemon'], {
       detached: true,
       stdio: 'ignore',
     });
     child.unref();
+    log('cli', 'daemon: spawned pid=', child.pid);
 
     // Wait for socket (includes time for user to click Allow)
     for (let i = 0; i < DAEMON_CONNECT_RETRIES; i++) {
@@ -1729,6 +2031,7 @@ const NEEDS_TARGET = new Set([
 
 async function main() {
   const [cmd, ...args] = process.argv.slice(2);
+  log('cli', 'command:', cmd, args.slice(0, 2).map(a => (a || '').length > 80 ? a.slice(0, 80) + '…' : a).join(' '));
 
   // Daemon mode (internal)
   if (cmd === '_browser_daemon') { await runBrowserDaemon(); return; }
@@ -1756,11 +2059,27 @@ async function main() {
   // Open new tab — routed through daemon to reuse existing Chrome connection
   if (cmd === 'open') {
     const url = args[0] || 'about:blank';
-    const conn = await getOrStartBrowserDaemon();
+    let conn;
+    try {
+      conn = await getOrStartBrowserDaemon();
+    } catch (e) {
+      // CDP unavailable (Chrome running without remote debugging): fall back
+      // to the system-level open so "open a tab" always works on macOS.
+      if (process.platform === 'darwin' && openUrlViaAppleScript(url)) {
+        console.log(`Opened ${url} via system (Chrome remote debugging off; daemon unavailable)`);
+        return;
+      }
+      console.error('Error:', e.message);
+      process.exit(1);
+    }
     const response = await sendCommand(conn, { cmd: 'open', args: [url] });
     if (!response.ok) { console.error('Error:', response.error); process.exit(1); }
-    const { targetId } = JSON.parse(response.result);
-    console.log(`Opened new tab: ${targetId.slice(0, 8)}  ${url}`);
+    const { targetId, reusedTab } = JSON.parse(response.result);
+    console.log(
+      reusedTab
+        ? `Reused blank tab: ${targetId.slice(0, 8)}  ${url}`
+        : `Opened new tab: ${targetId.slice(0, 8)}  ${url}`,
+    );
     return;
   }
 
@@ -1837,6 +2156,16 @@ export {
   tryAcquireSpawnLock,
   releaseSpawnLock,
   readDaemonPidFile,
+  findDevToolsActivePortFile,
+  devToolsPortLive,
+  waitForDevToolsActivePort,
+  isBrowserProcessRunning,
+  resolveLastUsedProfile,
+  chromeLaunchArgs,
+  launchChrome,
+  ensureChromeAvailable,
+  findReusableTab,
+  localStateUserEnabled,
 };
 
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;

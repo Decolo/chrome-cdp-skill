@@ -1,0 +1,182 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import {
+  findReusableTab,
+  resolveLastUsedProfile,
+  chromeLaunchArgs,
+  devToolsPortLive,
+  findDevToolsActivePortFile,
+  localStateUserEnabled,
+} from '../skills/chrome-cdp/scripts/cdp.mjs';
+
+function tempDir(t) {
+  const dir = mkdtempSync(join(tmpdir(), 'cdp-align-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  return dir;
+}
+
+// ---------------------------------------------------------------------------
+// findReusableTab: blank tabs are reused, real tabs are never touched
+// ---------------------------------------------------------------------------
+
+test('findReusableTab reuses about:blank and new-tab pages', () => {
+  const pages = [
+    { targetId: 'A', url: 'https://x.com/home', title: 'X' },
+    { targetId: 'B', url: 'about:blank', title: '' },
+  ];
+  assert.equal(findReusableTab(pages).targetId, 'B', 'about:blank is reusable');
+
+  const newtab = [
+    { targetId: 'A', url: 'chrome://newtab', title: 'New Tab' },
+    { targetId: 'C', url: 'https://google.com', title: 'Google' },
+  ];
+  assert.equal(findReusableTab(newtab).targetId, 'A', 'chrome://newtab is reusable');
+
+  const edge = [{ targetId: 'D', url: 'edge://newtab' }];
+  assert.equal(findReusableTab(edge).targetId, 'D', 'edge://newtab is reusable');
+
+  const blankHash = [{ targetId: 'E', url: 'about:blank#fragment' }];
+  assert.equal(findReusableTab(blankHash).targetId, 'E', 'about:blank#* is reusable');
+});
+
+test('findReusableTab never touches real pages', () => {
+  const pages = [
+    { targetId: 'A', url: 'https://x.com/home' },
+    { targetId: 'B', url: 'file:///tmp/a.html' },
+    { targetId: 'C', url: 'chrome://settings' },
+    { targetId: 'D', url: 'http://localhost:3000' },
+  ];
+  assert.equal(findReusableTab(pages), null, 'no blank tab among real pages');
+  assert.equal(findReusableTab([]), null);
+  assert.equal(findReusableTab(null), null);
+  assert.equal(findReusableTab([{ targetId: 'X' }]), null, 'missing url is not reusable');
+});
+
+test('findReusableTab picks the first reusable tab in order', () => {
+  const pages = [
+    { targetId: 'Z', url: 'https://news.ycombinator.com' },
+    { targetId: 'B', url: 'about:blank' },
+    { targetId: 'N', url: 'chrome://newtab' },
+  ];
+  assert.equal(findReusableTab(pages).targetId, 'B', 'earliest reusable wins');
+});
+
+// ---------------------------------------------------------------------------
+// resolveLastUsedProfile: parse Local State, skip profile picker on relaunch
+// ---------------------------------------------------------------------------
+
+test('resolveLastUsedProfile reads last_used from Local State', (t) => {
+  const dir = tempDir(t);
+  mkdirSync(join(dir, 'Profile 2'));
+  writeFileSync(join(dir, 'Local State'), JSON.stringify({ profile: { last_used: 'Profile 2' } }));
+  assert.equal(resolveLastUsedProfile(dir), 'Profile 2');
+});
+
+test('resolveLastUsedProfile falls back to null on missing/invalid Local State', (t) => {
+  const dir = tempDir(t);
+  assert.equal(resolveLastUsedProfile(dir), null, 'no Local State -> null');
+  writeFileSync(join(dir, 'Local State'), 'not json {');
+  assert.equal(resolveLastUsedProfile(dir), null, 'corrupt Local State -> null');
+  writeFileSync(join(dir, 'Local State'), JSON.stringify({ profile: { last_used: 'Ghost' } }));
+  assert.equal(resolveLastUsedProfile(dir), null, 'last_used dir missing -> null');
+  assert.equal(resolveLastUsedProfile(null), null);
+});
+
+// ---------------------------------------------------------------------------
+// chromeLaunchArgs
+// ---------------------------------------------------------------------------
+
+test('chromeLaunchArgs enables debugging and honors CDP_USER_DATA_DIR', (t) => {
+  const dir = tempDir(t);
+  const prev = process.env.CDP_USER_DATA_DIR;
+  process.env.CDP_USER_DATA_DIR = dir;
+  t.after(() => {
+    if (prev === undefined) delete process.env.CDP_USER_DATA_DIR;
+    else process.env.CDP_USER_DATA_DIR = prev;
+  });
+  const args = chromeLaunchArgs();
+  assert.ok(args.includes('--remote-debugging-port=0'), 'debugging on');
+  assert.ok(args.includes(`--user-data-dir=${dir}`), 'user-data-dir override wins');
+  assert.ok(!args.some(a => a.startsWith('--profile-directory')), 'no profile args with custom data dir');
+});
+
+// ---------------------------------------------------------------------------
+// devToolsPortLive: a file with a dead port is NOT trusted
+// ---------------------------------------------------------------------------
+
+test('devToolsPortLive rejects dead ports and bad files', async (t) => {
+  const dir = tempDir(t);
+  const bad = join(dir, 'bad-port');
+  writeFileSync(bad, 'not-a-port\n/path');
+  assert.equal(await devToolsPortLive(bad), false, 'non-numeric port');
+  const dead = join(dir, 'dead-port');
+  // port 1 is virtually never listening
+  writeFileSync(dead, '1\n/devtools/browser/abc');
+  assert.equal(await devToolsPortLive(dead), false, 'no listener on port 1');
+  assert.equal(await devToolsPortLive(null), false);
+  assert.equal(await devToolsPortLive(join(dir, 'missing')), false);
+});
+
+// ---------------------------------------------------------------------------
+// findDevToolsActivePortFile: CDP_PORT_FILE override
+// ---------------------------------------------------------------------------
+
+test('findDevToolsActivePortFile honors CDP_PORT_FILE', (t) => {
+  const dir = tempDir(t);
+  const f = join(dir, 'DevToolsActivePort');
+  writeFileSync(f, '9222\n/devtools/browser/x');
+  const prev = process.env.CDP_PORT_FILE;
+  process.env.CDP_PORT_FILE = f;
+  t.after(() => {
+    if (prev === undefined) delete process.env.CDP_PORT_FILE;
+    else process.env.CDP_PORT_FILE = prev;
+  });
+  assert.equal(findDevToolsActivePortFile(), f, 'override file wins');
+  rmSync(f);
+  const after = findDevToolsActivePortFile();
+  assert.notEqual(after, f, 'deleted override falls through to real candidates');
+  assert.ok(after === null || after.endsWith('DevToolsActivePort'));
+});
+
+// ---------------------------------------------------------------------------
+// Local State switch detection (browser-harness alignment)
+// ---------------------------------------------------------------------------
+
+test('localStateUserEnabled reads devtools.remote_debugging.user-enabled', (t) => {
+  const dir = tempDir(t);
+  writeFileSync(join(dir, 'Local State'), JSON.stringify({ devtools: { remote_debugging: { 'user-enabled': true } } }));
+  assert.equal(localStateUserEnabled(dir), true);
+  writeFileSync(join(dir, 'Local State'), JSON.stringify({ devtools: { remote_debugging: { 'user-enabled': false } } }));
+  assert.equal(localStateUserEnabled(dir), false);
+  writeFileSync(join(dir, 'Local State'), JSON.stringify({}));
+  assert.equal(localStateUserEnabled(dir), null, 'absent -> null');
+  assert.equal(localStateUserEnabled(join(dir, 'missing')), null);
+});
+
+test('chromeLaunchArgs: no debug flag on default profile (Chrome 136+ switch path)', (t) => {
+  const prev = process.env.CDP_USER_DATA_DIR;
+  delete process.env.CDP_USER_DATA_DIR;
+  try {
+    const args = chromeLaunchArgs();
+    assert.ok(!args.some(a => a.includes('remote-debugging')), 'no --remote-debugging-port on default profile');
+    assert.ok(!args.some(a => a.includes('user-data-dir')), 'no user-data-dir on default profile');
+  } finally {
+    if (prev !== undefined) process.env.CDP_USER_DATA_DIR = prev;
+  }
+});
+
+test('chromeLaunchArgs: debug flag kept for custom user-data-dir', (t) => {
+  const dir = tempDir(t);
+  const prev = process.env.CDP_USER_DATA_DIR;
+  process.env.CDP_USER_DATA_DIR = dir;
+  t.after(() => {
+    if (prev === undefined) delete process.env.CDP_USER_DATA_DIR;
+    else process.env.CDP_USER_DATA_DIR = prev;
+  });
+  const args = chromeLaunchArgs();
+  assert.ok(args.includes('--remote-debugging-port=0'), 'flag kept for custom data dir');
+  assert.ok(args.includes(`--user-data-dir=${dir}`));
+});
