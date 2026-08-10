@@ -8,9 +8,10 @@
 // modal fires once per daemon (= once per Chrome session). Daemon lives
 // until Chrome disconnects or "cdp stop" is called.
 
-import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync } from 'fs';
+import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync, openSync, writeSync, closeSync, statSync, rmdirSync } from 'fs';
 import { homedir } from 'os';
 import { resolve } from 'path';
+import { pathToFileURL } from 'url';
 import { spawn } from 'child_process';
 import net from 'net';
 
@@ -31,12 +32,13 @@ const RUNTIME_DIR = IS_WINDOWS
     ? resolve(process.env.XDG_RUNTIME_DIR, 'cdp')
     : resolve(homedir(), '.cache', 'cdp');
 try { mkdirSync(RUNTIME_DIR, { recursive: true, mode: 0o700 }); } catch {}
-const PAGES_CACHE = resolve(RUNTIME_DIR, 'pages.json');
-
 // Single browser-level daemon socket (one per Chrome session)
 const BROWSER_SOCK = IS_WINDOWS
   ? `\\\\.\\pipe\\cdp-browser`
   : resolve(RUNTIME_DIR, 'cdp-browser.sock');
+const DAEMON_PID_FILE = resolve(RUNTIME_DIR, 'cdp-browser.pid');
+const SPAWN_LOCK_DIR = resolve(RUNTIME_DIR, 'cdp-spawn.lock');
+const SOCKET_SELF_CHECK_MS = 5000;
 
 function getWsUrl() {
   const home = homedir();
@@ -311,8 +313,9 @@ class CDP {
       this.#ws.onmessage = (ev) => {
         const msg = JSON.parse(ev.data);
         if (msg.id && this.#pending.has(msg.id)) {
-          const { resolve, reject } = this.#pending.get(msg.id);
+          const { resolve, reject, timer } = this.#pending.get(msg.id);
           this.#pending.delete(msg.id);
+          clearTimeout(timer);
           if (msg.error) reject(new Error(msg.error.message));
           else resolve(msg.result);
         } else if (msg.method && this.#eventHandlers.has(msg.method)) {
@@ -327,16 +330,16 @@ class CDP {
   send(method, params = {}, sessionId) {
     const id = ++this.#id;
     return new Promise((resolve, reject) => {
-      this.#pending.set(id, { resolve, reject });
-      const msg = { id, method, params };
-      if (sessionId) msg.sessionId = sessionId;
-      this.#ws.send(JSON.stringify(msg));
-      setTimeout(() => {
+      const timer = setTimeout(() => {
         if (this.#pending.has(id)) {
           this.#pending.delete(id);
           reject(new Error(`Timeout: ${method}`));
         }
       }, TIMEOUT);
+      this.#pending.set(id, { resolve, reject, timer });
+      const msg = { id, method, params };
+      if (sessionId) msg.sessionId = sessionId;
+      this.#ws.send(JSON.stringify(msg));
     });
   }
 
@@ -952,6 +955,34 @@ async function evalRawStr(cdp, sid, method, paramsJson) {
   return JSON.stringify(result, null, 2);
 }
 
+// Resolve a CDP session for a targetId, reusing the two-level attach sessions
+// map populated by Target.attachedToTarget events.
+//
+// - sessions has the id → reuse immediately (common case, ~0ms).
+// - id unknown to the page list → fast-fail instead of waiting 500ms for an
+//   attach event that will never come (stale/closed target ids).
+// - id known but not attached yet → wait briefly for the async two-level
+//   attach events to settle (freshly opened tabs), then fall back to a direct
+//   Target.attachToTarget for Chrome versions without 'tab' target support.
+async function resolveSession({ sessions, isKnownTarget, attach, targetId, waitTries = 10, waitDelayMs = 50, sleepFn = sleep }) {
+  if (sessions.has(targetId)) {
+    return { sessionId: sessions.get(targetId), attachMs: 0, attachMode: 'reuse' };
+  }
+  const known = await isKnownTarget(targetId);
+  if (!known) {
+    throw new Error('No target with given id found — run "cdp list"');
+  }
+  const started = Date.now();
+  for (let i = 0; i < waitTries; i++) {
+    await sleepFn(waitDelayMs);
+    if (sessions.has(targetId)) {
+      return { sessionId: sessions.get(targetId), attachMs: Date.now() - started, attachMode: 'wait' };
+    }
+  }
+  const sessionId = await attach(targetId);
+  return { sessionId, attachMs: Date.now() - started, attachMode: 'attach' };
+}
+
 // ---------------------------------------------------------------------------
 // Browser-level daemon (single WebSocket connection, manages all tab sessions)
 // ---------------------------------------------------------------------------
@@ -959,10 +990,23 @@ async function evalRawStr(cdp, sid, method, paramsJson) {
 async function runBrowserDaemon() {
   const sp = BROWSER_SOCK;
 
+  // Single-instance guarantee: if another daemon already holds the pid file,
+  // exit immediately instead of becoming a second, socket-clobbering daemon.
+  const pidLock = acquireDaemonPidLock();
+  if (!pidLock.ok) {
+    process.stderr.write(
+      pidLock.existingPid
+        ? `Browser daemon already running (pid ${pidLock.existingPid}); exiting.\n`
+        : `Browser daemon already running; exiting.\n`,
+    );
+    process.exit(0);
+  }
+
   const cdp = new CDP();
   try {
     await cdp.connect(getWsUrl());
   } catch (e) {
+    releaseDaemonPidLock();
     process.stderr.write(`Browser daemon: cannot connect to Chrome: ${e.message}\n`);
     process.exit(1);
   }
@@ -1122,6 +1166,7 @@ async function runBrowserDaemon() {
     alive = false;
     server.close();
     if (!IS_WINDOWS) try { unlinkSync(sp); } catch {}
+    releaseDaemonPidLock();
     cdp.close();
     process.exit(0);
   }
@@ -1181,19 +1226,19 @@ async function runBrowserDaemon() {
 
   // Get or wait for a session for a given targetId.
   async function getSession(targetId) {
-    if (sessions.has(targetId)) return { sessionId: sessions.get(targetId), attachMs: 0, attachMode: 'reuse' };
-    const started = Date.now();
-    // Wait up to 500ms for the two-level attach events to settle
-    for (let i = 0; i < 10; i++) {
-      await sleep(50);
-      if (sessions.has(targetId)) {
-        return { sessionId: sessions.get(targetId), attachMs: Date.now() - started, attachMode: 'wait' };
-      }
-    }
-    // Fallback for Chrome versions without 'tab' target support
-    const res = await cdp.send('Target.attachToTarget', { targetId, flatten: true });
-    sessions.set(targetId, res.sessionId);
-    return { sessionId: res.sessionId, attachMs: Date.now() - started, attachMode: 'attach' };
+    return resolveSession({
+      sessions,
+      isKnownTarget: async (tid) => {
+        const { pages } = await getPagesCached();
+        return pages.some((p) => p.targetId === tid);
+      },
+      attach: async (tid) => {
+        const res = await cdp.send('Target.attachToTarget', { targetId: tid, flatten: true });
+        sessions.set(tid, res.sessionId);
+        return res.sessionId;
+      },
+      targetId,
+    });
   }
 
   // Handle a command; targetId is required for tab-specific commands
@@ -1386,6 +1431,10 @@ async function runBrowserDaemon() {
           conn.write(JSON.stringify({ ok: false, error: 'Invalid JSON request', id: null }) + '\n');
           continue;
         }
+        // Ownership check: if this daemon's socket file was unlinked or
+        // replaced, it is an orphan — shut down instead of serving commands.
+        if (!alive) return;
+        if (!socketStillMine(sp, mySocketIno)) { shutdown(); return; }
         handleCommand(req).then((res) => {
           const payload = JSON.stringify({ ...res, id: req.id }) + '\n';
           if (res.stopAfter) conn.end(payload, shutdown);
@@ -1402,11 +1451,78 @@ async function runBrowserDaemon() {
 
   if (!IS_WINDOWS) try { unlinkSync(sp); } catch {}
   server.listen(sp);
+
+  // Orphan self-check: remember the inode of the socket file we created. If
+  // the file is ever unlinked or replaced (e.g. a stale daemon outliving its
+  // socket, or `cdp stop` racing a reconnect), this daemon is no longer the
+  // single server and must exit. Checked per command and on an idle timer so
+  // even a quiet orphan does not linger.
+  let mySocketIno = null;
+  try { mySocketIno = statSync(sp).ino; } catch {}
+  const ensureSocketIsMine = () => {
+    if (!alive) return;
+    if (!socketStillMine(sp, mySocketIno)) shutdown();
+  };
+  setInterval(ensureSocketIsMine, SOCKET_SELF_CHECK_MS);
+
 }
 
 // ---------------------------------------------------------------------------
 // CLI ↔ daemon communication
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Single-daemon guarantees: all cdp commands share ONE daemon process.
+//   - daemon side: exclusive pid file (second daemon exits immediately),
+//     socket-inode self-check (an orphaned daemon whose socket file was
+//     unlinked/replaced shuts itself down)
+//   - CLI side: atomic mkdir spawn lock (only one CLI spawns; others wait),
+//     stale pid/socket cleanup before spawning
+// ---------------------------------------------------------------------------
+
+function acquireDaemonPidLock(pidFile = DAEMON_PID_FILE) {
+  try {
+    const fd = openSync(pidFile, 'wx');
+    writeSync(fd, String(process.pid));
+    closeSync(fd);
+    return { ok: true };
+  } catch (error) {
+    if (error.code === 'EEXIST') {
+      let existingPid = null;
+      try { existingPid = Number.parseInt(readFileSync(pidFile, 'utf8').trim(), 10) || null; } catch {}
+      return { ok: false, existingPid };
+    }
+    return { ok: false, error: error.message };
+  }
+}
+
+function releaseDaemonPidLock(pidFile = DAEMON_PID_FILE) {
+  try { unlinkSync(pidFile); } catch {}
+}
+
+function isProcessAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; }
+}
+
+// True while socketPath still refers to the inode this daemon created.
+function socketStillMine(socketPath, expectedIno) {
+  if (expectedIno == null) return true;
+  try { return statSync(socketPath).ino === expectedIno; } catch { return false; }
+}
+
+// mkdir is atomic: exactly one CLI wins the spawner role.
+function tryAcquireSpawnLock(lockDir = SPAWN_LOCK_DIR) {
+  try { mkdirSync(lockDir, { mode: 0o700 }); return true; } catch { return false; }
+}
+
+function releaseSpawnLock(lockDir = SPAWN_LOCK_DIR) {
+  try { rmdirSync(lockDir); } catch {}
+}
+
+function readDaemonPidFile(pidFile = DAEMON_PID_FILE) {
+  try { return Number.parseInt(readFileSync(pidFile, 'utf8').trim(), 10) || null; } catch { return null; }
+}
 
 function connectToSocket(sp) {
   return new Promise((resolve, reject) => {
@@ -1417,76 +1533,115 @@ function connectToSocket(sp) {
 }
 
 async function getOrStartBrowserDaemon() {
-  // Try existing browser daemon
+  // 1) Fast path: the single daemon's socket is already there.
   try { return await connectToSocket(BROWSER_SOCK); } catch {}
 
-  // Clean stale socket
+  // 2) A daemon process may be alive but its socket file missing (e.g. it was
+  //    unlinked while the daemon still runs). Wait briefly for it to recover
+  //    before considering spawning a replacement.
+  const existingPid = readDaemonPidFile();
+  if (existingPid != null && isProcessAlive(existingPid)) {
+    for (let i = 0; i < DAEMON_CONNECT_RETRIES; i++) {
+      await sleep(DAEMON_CONNECT_DELAY);
+      try { return await connectToSocket(BROWSER_SOCK); } catch {}
+    }
+    throw new Error(
+      `Browser daemon (pid ${existingPid}) is running but its socket is unavailable. ` +
+      'Run "cdp stop" and retry.',
+    );
+  }
+
+  // 3) No live daemon: clear stale pid/socket files, then race to spawn with
+  //    an atomic mkdir lock so exactly ONE CLI process spawns the daemon and
+  //    the others wait for its socket.
+  if (existingPid != null) releaseDaemonPidLock();
   if (!IS_WINDOWS) try { unlinkSync(BROWSER_SOCK); } catch {}
 
-  // Spawn daemon
-  const child = spawn(process.execPath, [process.argv[1], '_browser_daemon'], {
-    detached: true,
-    stdio: 'ignore',
-  });
-  child.unref();
-
-  // Wait for socket (includes time for user to click Allow)
-  for (let i = 0; i < DAEMON_CONNECT_RETRIES; i++) {
-    await sleep(DAEMON_CONNECT_DELAY);
-    try { return await connectToSocket(BROWSER_SOCK); } catch {}
+  if (!tryAcquireSpawnLock()) {
+    // Another CLI is already spawning: wait for its daemon's socket.
+    for (let i = 0; i < DAEMON_CONNECT_RETRIES; i++) {
+      await sleep(DAEMON_CONNECT_DELAY);
+      try { return await connectToSocket(BROWSER_SOCK); } catch {}
+    }
+    throw new Error('Browser daemon failed to start (another CLI is spawning it, socket never appeared).');
   }
-  throw new Error('Browser daemon failed to start — did you click Allow in Chrome?');
+  try {
+    // Double-check after winning the lock (the winner may have been this fast
+    // path earlier, or another CLI just released it).
+    try { return await connectToSocket(BROWSER_SOCK); } catch {}
+
+    // Spawn daemon
+    const child = spawn(process.execPath, [process.argv[1], '_browser_daemon'], {
+      detached: true,
+      stdio: 'ignore',
+    });
+    child.unref();
+
+    // Wait for socket (includes time for user to click Allow)
+    for (let i = 0; i < DAEMON_CONNECT_RETRIES; i++) {
+      await sleep(DAEMON_CONNECT_DELAY);
+      try { return await connectToSocket(BROWSER_SOCK); } catch {}
+    }
+    throw new Error('Browser daemon failed to start — did you click Allow in Chrome?');
+  } finally {
+    releaseSpawnLock();
+  }
 }
 
-function sendCommand(conn, req) {
+// Per-connection state so one socket can carry multiple request/response
+// round trips (daemon responses are matched by id, arrival order is not
+// guaranteed because the daemon handles requests concurrently).
+const connStates = new WeakMap();
+function connState(conn) {
+  let st = connStates.get(conn);
+  if (!st) {
+    st = { nextId: 1, pending: new Map(), buf: '', wired: false, closeRequested: false };
+    connStates.set(conn, st);
+  }
+  return st;
+}
+
+function wireConn(conn, st) {
+  if (st.wired) return;
+  st.wired = true;
+  const failAll = (message) => {
+    for (const [, pending] of st.pending) {
+      st.pending.delete(pending.id);
+      pending.reject(new Error(message));
+    }
+  };
+  conn.on('data', (chunk) => {
+    st.buf += chunk.toString();
+    const lines = st.buf.split('\n');
+    st.buf = lines.pop();
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      let msg;
+      try { msg = JSON.parse(line); } catch { continue; }
+      const pending = st.pending.get(msg.id);
+      if (!pending) continue;
+      st.pending.delete(msg.id);
+      if (pending.closeAfter) st.closeRequested = true;
+      if (msg.error) pending.reject(new Error(msg.error));
+      else pending.resolve(msg);
+    }
+    // Close only when every in-flight request has settled AND someone asked
+    // for the connection to close — otherwise a close:true response arriving
+    // before a close:false one would kill the still-pending request.
+    if (st.pending.size === 0 && st.closeRequested) conn.end();
+  });
+  conn.on('error', (error) => failAll(error.message));
+  conn.on('end', () => failAll('Connection closed before response'));
+  conn.on('close', () => failAll('Connection closed before response'));
+}
+
+function sendCommand(conn, req, { close = true } = {}) {
+  const st = connState(conn);
+  wireConn(conn, st);
+  const id = st.nextId++;
   return new Promise((resolve, reject) => {
-    let buf = '';
-    let settled = false;
-
-    const cleanup = () => {
-      conn.off('data', onData);
-      conn.off('error', onError);
-      conn.off('end', onEnd);
-      conn.off('close', onClose);
-    };
-
-    const onData = (chunk) => {
-      buf += chunk.toString();
-      const idx = buf.indexOf('\n');
-      if (idx === -1) return;
-      settled = true;
-      cleanup();
-      resolve(JSON.parse(buf.slice(0, idx)));
-      conn.end();
-    };
-
-    const onError = (error) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      reject(error);
-    };
-
-    const onEnd = () => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      reject(new Error('Connection closed before response'));
-    };
-
-    const onClose = () => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      reject(new Error('Connection closed before response'));
-    };
-
-    conn.on('data', onData);
-    conn.on('error', onError);
-    conn.on('end', onEnd);
-    conn.on('close', onClose);
-    req.id = 1;
-    conn.write(JSON.stringify(req) + '\n');
+    st.pending.set(id, { id, resolve, reject, closeAfter: close });
+    conn.write(JSON.stringify({ ...req, id }) + '\n');
   });
 }
 
@@ -1501,25 +1656,6 @@ async function stopDaemon() {
   } catch {
     if (!IS_WINDOWS) try { unlinkSync(BROWSER_SOCK); } catch {}
   }
-}
-
-async function refreshPagesCache() {
-  const conn = await getOrStartBrowserDaemon();
-  const raw = await sendCommand(conn, { cmd: 'list_raw', args: [] });
-  if (!raw.ok) throw new Error(raw.error || 'Failed to refresh page list');
-  writeFileSync(PAGES_CACHE, raw.result, { mode: 0o600 });
-  return JSON.parse(raw.result);
-}
-
-async function resolveTargetId(targetPrefix) {
-  const conn = await getOrStartBrowserDaemon();
-  const response = await sendCommand(conn, { cmd: 'resolve_target', args: [targetPrefix] });
-  if (!response.ok) throw new Error(response.error || 'Failed to resolve target');
-  const data = JSON.parse(response.result);
-  if (data.pages) {
-    writeFileSync(PAGES_CACHE, JSON.stringify(data.pages), { mode: 0o600 });
-  }
-  return data.targetId;
 }
 
 // ---------------------------------------------------------------------------
@@ -1605,7 +1741,6 @@ async function main() {
     const conn = await getOrStartBrowserDaemon();
     const response = await sendCommand(conn, { cmd: 'list', args: [] });
     if (!response.ok) { console.error('Error:', response.error); process.exit(1); }
-    await refreshPagesCache().catch(() => {});
     console.log(response.result);
     return;
   }
@@ -1624,8 +1759,7 @@ async function main() {
     const conn = await getOrStartBrowserDaemon();
     const response = await sendCommand(conn, { cmd: 'open', args: [url] });
     if (!response.ok) { console.error('Error:', response.error); process.exit(1); }
-    const { targetId, pages } = JSON.parse(response.result);
-    writeFileSync(PAGES_CACHE, JSON.stringify(pages), { mode: 0o600 });
+    const { targetId } = JSON.parse(response.result);
     console.log(`Opened new tab: ${targetId.slice(0, 8)}  ${url}`);
     return;
   }
@@ -1649,11 +1783,7 @@ async function main() {
     process.exit(1);
   }
 
-  // Resolve prefix → full targetId from pages cache
-  const targetId = await resolveTargetId(targetPrefix);
-
   const conn = await getOrStartBrowserDaemon();
-
   const cmdArgs = args.slice(1);
 
   if (cmd === 'eval') {
@@ -1676,6 +1806,15 @@ async function main() {
     process.exit(1);
   }
 
+  // One connection, two round trips: resolve the target prefix, then run the
+  // command. The daemon's response for resolve_target carries the full id.
+  const resolved = await sendCommand(conn, { cmd: 'resolve_target', args: [targetPrefix] }, { close: false });
+  if (!resolved.ok) {
+    console.error('Error:', resolved.error);
+    process.exit(1);
+  }
+  const targetId = JSON.parse(resolved.result).targetId;
+
   const response = await sendCommand(conn, { cmd, targetId, args: cmdArgs });
 
   if (response.ok) {
@@ -1686,4 +1825,21 @@ async function main() {
   }
 }
 
-main().catch(e => { console.error(e.message); process.exit(1); });
+export {
+  CDP,
+  resolveSession,
+  sendCommand,
+  connState,
+  acquireDaemonPidLock,
+  releaseDaemonPidLock,
+  isProcessAlive,
+  socketStillMine,
+  tryAcquireSpawnLock,
+  releaseSpawnLock,
+  readDaemonPidFile,
+};
+
+const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isMain) {
+  main().catch(e => { console.error(e.message); process.exit(1); });
+}
