@@ -802,6 +802,49 @@ async function snapshotStr(cdp, sid, compact = false) {
   return lines.join('\n');
 }
 
+function parseWaitArgs(args) {
+  let selector = args[0];
+  let timeout = 10000;
+  let visible = false;
+  for (let i = 1; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--visible') visible = true;
+    else if (a === '--timeout') timeout = parsePositiveInteger(args[++i], 'timeout');
+    else throw new Error(`Unknown wait option: ${a}`);
+  }
+  if (!selector) throw new Error('wait: selector required');
+  return { selector, timeout, visible };
+}
+
+async function waitStr(cdp, sid, args) {
+  const { selector, timeout, visible } = parseWaitArgs(args);
+  const startedAt = Date.now();
+  const deadline = startedAt + timeout;
+  // checkVisibility walks the ancestor chain and respects display:none /
+  // visibility:hidden / opacity:0 on parents, which getComputedStyle on the
+  // element alone misses. Falls back to the per-element CSS check on older
+  // Chrome lacking checkVisibility (borrowed from browser-harness helpers).
+  const checkExpr = visible
+    ? `(()=>{const e=document.querySelector(${JSON.stringify(selector)});if(!e)return false;if(typeof e.checkVisibility==='function')return e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true});const s=getComputedStyle(e);return s.display!=='none'&&s.visibility!=='hidden'&&s.opacity!=='0'})()`
+    : `(()=>!!document.querySelector(${JSON.stringify(selector)}))()`;
+  let found = false;
+  let lastError;
+  while (Date.now() < deadline) {
+    try {
+      const r = await cdp.send('Runtime.evaluate', { expression: checkExpr, returnByValue: true }, sid);
+      if (r.exceptionDetails) throw new Error(r.exceptionDetails.text || r.exceptionDetails.exception?.description);
+      if (r.result.value) { found = true; break; }
+    } catch (e) {
+      lastError = e;
+    }
+    await sleep(200);
+  }
+  const waitedMs = Date.now() - startedAt;
+  if (found) return JSON.stringify({ found: true, waitedMs });
+  if (lastError) throw new Error(`wait: ${lastError.message}`);
+  return JSON.stringify({ found: false, waitedMs });
+}
+
 async function evalStr(cdp, sid, expression) {
   await cdp.send('Runtime.enable', {}, sid);
   const result = await cdp.send('Runtime.evaluate', {
@@ -1704,6 +1747,9 @@ async function runBrowserDaemon() {
               case 'evalraw':
                 commandResult = await evalRawStr(cdp, sessionId, args[0], args[1]);
                 break;
+              case 'wait':
+                commandResult = await waitStr(cdp, sessionId, args);
+                break;
               default: throw new Error(`Unknown command: ${cmd}`);
             }
             trace.commandMs = Date.now() - commandStarted;
@@ -2051,6 +2097,9 @@ Usage: cdp <command> [args]
                                     Works in cross-origin iframes unlike eval-based approaches
   loadall <target> <selector> [ms]  Repeatedly click a "load more" button until it disappears
                                     Optional interval in ms between clicks (default 1500)
+  wait  <target> <selector> [--timeout <ms>] [--visible]
+                                    Wait for a CSS selector to appear (default 10s)
+                                    --visible: also require non-hidden and in-layout
   evalraw <target> <method> [json]  Send a raw CDP command; returns JSON result
                                     e.g. evalraw <t> "DOM.getDocument" '{}'
   open  [url]                       Open url in a blank tab if one exists (reused), else a new tab (default: about:blank)
@@ -2084,13 +2133,13 @@ DAEMON IPC (for advanced use / scripting)
     Response: {"id":<number>, "ok":true,  "result":"<string>"}
            or {"id":<number>, "ok":false, "error":"<message>"}
   Commands mirror the CLI: stats, inspect, snap, eval, shot, html, nav, net,
-  click, clickxy, type, loadall, evalraw, stop. Use evalraw to send arbitrary CDP methods.
+  click, clickxy, type, loadall, wait, evalraw, stop. Use evalraw to send arbitrary CDP methods.
   The socket disappears when Chrome disconnects or after "cdp stop".
 `;
 
 const NEEDS_TARGET = new Set([
   'inspect','snap','snapshot','eval','shot','screenshot','html','nav','navigate',
-  'net','network','click','clickxy','type','loadall','evalraw',
+  'net','network','click','clickxy','type','loadall','evalraw','wait',
 ]);
 
 async function main() {

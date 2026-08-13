@@ -76,8 +76,10 @@ scripts/cdp.mjs click   <target> <selector>    # click element by CSS selector
 scripts/cdp.mjs clickxy <target> <x> <y>       # click at CSS pixel coords
 scripts/cdp.mjs type    <target> <text>         # Input.insertText at current focus; works in cross-origin iframes unlike eval
 scripts/cdp.mjs loadall <target> <selector> [ms]  # click "load more" until gone (default 1500ms between clicks)
+scripts/cdp.mjs wait    <target> <selector> [--timeout 10000] [--visible]  # wait for CSS selector to appear (default 10s); --visible also requires non-hidden + in-layout
 scripts/cdp.mjs evalraw <target> <method> [json]  # raw CDP command passthrough
 scripts/cdp.mjs open    [url]                  # open url in a blank tab if one exists (reused), else a new tab
+scripts/cdp.mjs wait    <target> <selector> [--timeout ms] [--visible]  # wait for element (SPA-safe; use after actions that trigger async rendering)
 scripts/cdp.mjs list                              # reuses the single browser daemon; auto-launches
                                                     Chrome with remote debugging if it is not running
 scripts/cdp.mjs stats                          # daemon health and recent command timings
@@ -102,6 +104,7 @@ CSS px = screenshot image px / DPR
 - Prefer one combined `eval` over many small `eval` calls when collecting structured page data.
 - Use `net --same-origin` or `--type` before broad resource listings when you only need one slice.
 - Use `stats` to spot commands that are setup-heavy or return unusually large payloads, not just slow ones.
+- `nav` only waits for `readyState=complete` — SPAs render after that. Use `wait <target> <selector>` after actions that trigger async rendering (route changes, data fetches); add `--visible` when the element may exist hidden in the DOM.
 - Chrome shows an "Allow debugging" modal once per Chrome session. A background browser daemon keeps the CDP connection alive so subsequent commands need no further approval until Chrome disconnects or you run `stop`. Each daemon start makes exactly ONE connection attempt (20s window) — one popup, click it, done; cdp never reconnects inside a daemon lifetime, so popups can't pile up.
 - If Chrome is not running at all, `cdp` launches it automatically with the
   last-used profile — no manual start needed. Chrome 136+ ignores
