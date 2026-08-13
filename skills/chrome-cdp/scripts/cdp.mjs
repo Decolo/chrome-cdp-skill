@@ -803,47 +803,57 @@ async function snapshotStr(cdp, sid, compact = false) {
 }
 
 function parseWaitArgs(args) {
-  let selector = args[0];
+  let selector = null;
   let timeout = 10000;
   let visible = false;
-  for (let i = 1; i < args.length; i++) {
+  let load = false;
+  for (let i = 0; i < args.length; i++) {
     const a = args[i];
-    if (a === '--visible') visible = true;
+    if (a === '--load') load = true;
+    else if (a === '--visible') visible = true;
     else if (a === '--timeout') timeout = parsePositiveInteger(args[++i], 'timeout');
+    else if (!selector) selector = a; // first non-flag arg is the selector
     else throw new Error(`Unknown wait option: ${a}`);
   }
-  if (!selector) throw new Error('wait: selector required');
-  return { selector, timeout, visible };
+  if (load) {
+    if (selector) throw new Error('wait: --load cannot be combined with a selector');
+    if (visible) throw new Error('wait: --visible is only for element waits');
+  } else if (!selector) {
+    throw new Error('wait: selector required (or use --load)');
+  }
+  return { selector, timeout, visible, load };
 }
 
 async function waitStr(cdp, sid, args) {
-  const { selector, timeout, visible } = parseWaitArgs(args);
+  const { selector, timeout, visible, load } = parseWaitArgs(args);
   const startedAt = Date.now();
   const deadline = startedAt + timeout;
-  // checkVisibility walks the ancestor chain and respects display:none /
-  // visibility:hidden / opacity:0 on parents, which getComputedStyle on the
-  // element alone misses. Falls back to the per-element CSS check on older
-  // Chrome lacking checkVisibility (borrowed from browser-harness helpers).
-  const checkExpr = visible
-    ? `(()=>{const e=document.querySelector(${JSON.stringify(selector)});if(!e)return false;if(typeof e.checkVisibility==='function')return e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true});const s=getComputedStyle(e);return s.display!=='none'&&s.visibility!=='hidden'&&s.opacity!=='0'})()`
-    : `(()=>!!document.querySelector(${JSON.stringify(selector)}))()`;
+  const expression = load
+    ? 'document.readyState'
+    : visible
+      ? `(()=>{const e=document.querySelector(${JSON.stringify(selector)});if(!e)return false;if(typeof e.checkVisibility==='function')return e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true});const s=getComputedStyle(e);return s.display!=='none'&&s.visibility!=='hidden'&&s.opacity!=='0'})()`
+      : `(()=>!!document.querySelector(${JSON.stringify(selector)}))()`;
+  const done = load ? (v) => v === 'complete' : (v) => v === true;
   let found = false;
+  let lastState = '';
   let lastError;
   while (Date.now() < deadline) {
     try {
-      const r = await cdp.send('Runtime.evaluate', { expression: checkExpr, returnByValue: true }, sid);
+      const r = await cdp.send('Runtime.evaluate', { expression, returnByValue: true }, sid);
       if (r.exceptionDetails) throw new Error(r.exceptionDetails.text || r.exceptionDetails.exception?.description);
+      lastState = r.result.value;
       lastError = undefined;  // a clean poll resets transient failures (SPA nav, busy main thread)
-      if (r.result.value) { found = true; break; }
+      if (done(lastState)) { found = true; break; }
     } catch (e) {
       lastError = e;
     }
     await sleep(200);
   }
   const waitedMs = Date.now() - startedAt;
-  if (found) return JSON.stringify({ found: true, waitedMs });
+  const extra = load ? { readyState: String(lastState ?? '') } : {};
+  if (found) return JSON.stringify({ found: true, waitedMs, ...extra });
   if (lastError) throw new Error(`wait: ${lastError.message}`);
-  return JSON.stringify({ found: false, waitedMs });
+  return JSON.stringify({ found: false, waitedMs, ...extra });
 }
 
 async function evalStr(cdp, sid, expression) {

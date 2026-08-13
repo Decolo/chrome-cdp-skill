@@ -77,6 +77,7 @@ scripts/cdp.mjs clickxy <target> <x> <y>       # click at CSS pixel coords
 scripts/cdp.mjs type    <target> <text>         # Input.insertText at current focus; works in cross-origin iframes unlike eval
 scripts/cdp.mjs loadall <target> <selector> [ms]  # click "load more" until gone (default 1500ms between clicks)
 scripts/cdp.mjs wait    <target> <selector> [--timeout ms] [--visible]  # wait for CSS selector to appear (default 10s); --visible also requires non-hidden + in-layout
+scripts/cdp.mjs wait    <target> --load [--timeout ms]  # wait for document.readyState == 'complete'
 scripts/cdp.mjs evalraw <target> <method> [json]  # raw CDP command passthrough
 scripts/cdp.mjs open    [url]                  # open url in a blank tab if one exists (reused), else a new tab
 scripts/cdp.mjs list                              # reuses the single browser daemon; auto-launches
