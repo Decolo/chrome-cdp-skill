@@ -105,6 +105,7 @@ CSS px = screenshot image px / DPR
 - Use `net --same-origin` or `--type` before broad resource listings when you only need one slice.
 - Use `stats` to spot commands that are setup-heavy or return unusually large payloads, not just slow ones.
 - `nav` only waits for `readyState=complete` — SPAs render after that. Use `wait <target> <selector>` after actions that trigger async rendering (route changes, data fetches); add `--visible` when the element may exist hidden in the DOM.
+- `wait --load` reports the current document's readyState. After `open`, navigation is async: the new tab briefly stays on `about:blank` whose readyState is already `complete`, so `wait --load` right after `open` can false-positive on the pre-navigation document. Reliable patterns: use `nav` (which gates on the load event) or poll `location.href` first (as the e2e scripts do).
 - Chrome shows an "Allow debugging" modal once per Chrome session. A background browser daemon keeps the CDP connection alive so subsequent commands need no further approval until Chrome disconnects or you run `stop`. Each daemon start makes exactly ONE connection attempt (20s window) — one popup, click it, done; cdp never reconnects inside a daemon lifetime, so popups can't pile up.
 - If Chrome is not running at all, `cdp` launches it automatically with the
   last-used profile — no manual start needed. Chrome 136+ ignores

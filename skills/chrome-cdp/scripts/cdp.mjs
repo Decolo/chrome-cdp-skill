@@ -2111,6 +2111,8 @@ Usage: cdp <command> [args]
   wait  <target> <selector> [--timeout <ms>] [--visible]
                                     Wait for a CSS selector to appear (default 10s)
                                     --visible: also require non-hidden and in-layout
+  wait  <target> --load [--timeout <ms>]
+                                    Wait for document.readyState == 'complete' (SPA-safe page load)
   evalraw <target> <method> [json]  Send a raw CDP command; returns JSON result
                                     e.g. evalraw <t> "DOM.getDocument" '{}'
   open  [url]                       Open url in a blank tab if one exists (reused), else a new tab (default: about:blank)
