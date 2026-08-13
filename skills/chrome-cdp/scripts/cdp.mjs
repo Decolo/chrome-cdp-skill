@@ -833,6 +833,7 @@ async function waitStr(cdp, sid, args) {
     try {
       const r = await cdp.send('Runtime.evaluate', { expression: checkExpr, returnByValue: true }, sid);
       if (r.exceptionDetails) throw new Error(r.exceptionDetails.text || r.exceptionDetails.exception?.description);
+      lastError = undefined;  // a clean poll resets transient failures (SPA nav, busy main thread)
       if (r.result.value) { found = true; break; }
     } catch (e) {
       lastError = e;
