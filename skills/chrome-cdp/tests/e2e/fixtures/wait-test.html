@@ -1,0 +1,14 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>cdp wait e2e</title></head>
+<body>
+<h1 id="already-here">visible headline</h1>
+<div id="hidden" style="display:none">hidden for visible-test</div>
+<script>
+  setTimeout(() => {
+    const d = document.createElement('div');
+    d.id = 'late';
+    d.textContent = 'late content';
+    document.body.appendChild(d);
+  }, 3000);
+</script>
+</body></html>
