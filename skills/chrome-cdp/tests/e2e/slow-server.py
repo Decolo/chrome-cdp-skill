@@ -2,8 +2,12 @@
 """Slow-resource server for chrome-cdp e2e tests.
 
 Endpoints:
-  /slowimg   HTML with <img src="/img3">  (img delayed 3s -> page stays loading)
-  /neverimg  HTML with <img src="/img8">  (img delayed 8s -> long loading)
+  /slowimg    HTML with <img src="/img3">     (img delayed 3s -> page stays loading)
+  /neverimg   HTML with <img src="/img8">     (img delayed 8s -> long loading)
+  /slowfetch  HTML that fetches /data3        (fetch delayed 3s -> network busy,
+                                               readyState already complete)
+  /data3      JSON response delayed 3s
+  /stream     chunked response, one chunk every 200ms (never-ending request)
 
 Rationale: a slow HTML response does NOT keep readyState 'loading' for long —
 the URL commits when the response header arrives and a tiny document is
@@ -32,6 +36,29 @@ class H(BaseHTTPRequestHandler):
             delay, body, ctype = 3, GIF, 'image/gif'
         elif self.path == '/img8':
             delay, body, ctype = 8, GIF, 'image/gif'
+        elif self.path == '/slowfetch':
+            body = (b'<html><head><title>slowfetch</title></head><body>'
+                    b'<script>fetch("/data3").then(r=>r.text()).then(t=>{'
+                    b'document.title="slowfetch done "+t})</script></body></html>')
+        elif self.path == '/data3':
+            delay, body, ctype = 3, b'{"ok":true}', 'application/json'
+        elif self.path == '/streamfetch':
+            body = (b'<html><head><title>streamfetch</title></head><body>'
+                    b'<script>fetch("/stream")</script></body></html>')
+        elif self.path == '/stream':
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/plain')
+            self.send_header('Transfer-Encoding', 'chunked')
+            self.end_headers()
+            try:
+                for _ in range(60):
+                    self.wfile.write(b'4\r\ndata\r\n')
+                    self.wfile.flush()
+                    time.sleep(0.2)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            self.wfile.write(b'0\r\n\r\n')
+            return
         else:
             self.send_response(404)
             self.end_headers()

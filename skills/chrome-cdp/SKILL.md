@@ -78,6 +78,7 @@ scripts/cdp.mjs type    <target> <text>         # Input.insertText at current fo
 scripts/cdp.mjs loadall <target> <selector> [ms]  # click "load more" until gone (default 1500ms between clicks)
 scripts/cdp.mjs wait    <target> <selector> [--timeout ms] [--visible]  # wait for CSS selector to appear (default 10s); --visible also requires non-hidden + in-layout
 scripts/cdp.mjs wait    <target> --load [--timeout ms]  # wait for document.readyState == 'complete'
+scripts/cdp.mjs wait    <target> --network-idle [--timeout ms] [--idle ms]  # wait until network quiet (default idle 500ms)
 scripts/cdp.mjs evalraw <target> <method> [json]  # raw CDP command passthrough
 scripts/cdp.mjs open    [url]                  # open url in a blank tab if one exists (reused), else a new tab
 scripts/cdp.mjs list                              # reuses the single browser daemon; auto-launches
@@ -106,6 +107,7 @@ CSS px = screenshot image px / DPR
 - Use `stats` to spot commands that are setup-heavy or return unusually large payloads, not just slow ones.
 - `nav` only waits for `readyState=complete` — SPAs render after that. Use `wait <target> <selector>` after actions that trigger async rendering (route changes, data fetches); add `--visible` when the element may exist hidden in the DOM.
 - `wait --load` reports the current document's readyState. After `open`, navigation is async: the new tab briefly stays on `about:blank` whose readyState is already `complete`, so `wait --load` right after `open` can false-positive on the pre-navigation document. Reliable patterns: use `nav` (which gates on the load event) or poll `location.href` first (as the e2e scripts do).
+- `wait --network-idle` is the SPA-safe counterpart of `--load`: readyState becomes `complete` before framework XHR/fetch settle. It tracks in-flight requests per tab (Network domain enabled at attach, events never replayed — attach happens before navigation, so tracking is complete from navigation start). Long-lived connections (SSE/keepalive/streaming) keep the page busy forever — the wait then times out with `inflight: n`; this matches browser-harness semantics.
 - Chrome shows an "Allow debugging" modal once per Chrome session. A background browser daemon keeps the CDP connection alive so subsequent commands need no further approval until Chrome disconnects or you run `stop`. Each daemon start makes exactly ONE connection attempt (20s window) — one popup, click it, done; cdp never reconnects inside a daemon lifetime, so popups can't pile up.
 - If Chrome is not running at all, `cdp` launches it automatically with the
   last-used profile — no manual start needed. Chrome 136+ ignores

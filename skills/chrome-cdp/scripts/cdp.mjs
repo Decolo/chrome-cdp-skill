@@ -807,27 +807,50 @@ function parseWaitArgs(args) {
   let timeout = 10000;
   let visible = false;
   let load = false;
+  let networkIdle = false;
+  let idleMs = 500;
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === '--load') load = true;
+    else if (a === '--network-idle') networkIdle = true;
     else if (a === '--visible') visible = true;
+    else if (a === '--idle') idleMs = parsePositiveInteger(args[++i], 'idle');
     else if (a === '--timeout') timeout = parsePositiveInteger(args[++i], 'timeout');
     else if (!selector) selector = a; // first non-flag arg is the selector
     else throw new Error(`Unknown wait option: ${a}`);
   }
-  if (load) {
-    if (selector) throw new Error('wait: --load cannot be combined with a selector');
+  const modes = [load, networkIdle].filter(Boolean).length;
+  if (modes > 1) throw new Error('wait: --load and --network-idle are mutually exclusive');
+  if (load || networkIdle) {
+    if (selector) throw new Error(`wait: ${load ? '--load' : '--network-idle'} cannot be combined with a selector`);
     if (visible) throw new Error('wait: --visible is only for element waits');
   } else if (!selector) {
-    throw new Error('wait: selector required (or use --load)');
+    throw new Error('wait: selector required (or use --load / --network-idle)');
   }
-  return { selector, timeout, visible, load };
+  return { selector, timeout, visible, load, networkIdle, idleMs };
 }
 
 async function waitStr(cdp, sid, args) {
-  const { selector, timeout, visible, load } = parseWaitArgs(args);
+  const { selector, timeout, visible, load, networkIdle, idleMs } = parseWaitArgs(args);
   const startedAt = Date.now();
   const deadline = startedAt + timeout;
+
+  if (networkIdle) {
+    // Idempotent enable: covers sessions attached before the tracker existed.
+    await cdp.send('Network.enable', {}, sid).catch(() => {});
+    const t = cdp.networkTrackers?.get(sid) ?? { inflight: new Set(), lastActivity: Date.now() };
+    let found = false;
+    let inflightCount = t.inflight.size;
+    while (Date.now() < deadline) {
+      inflightCount = t.inflight.size;
+      const quietMs = Date.now() - t.lastActivity;
+      if (inflightCount === 0 && quietMs >= idleMs) { found = true; break; }
+      await sleep(50);
+    }
+    const waitedMs = Date.now() - startedAt;
+    return JSON.stringify({ found, waitedMs, inflight: inflightCount, idleMs });
+  }
+
   const expression = load
     ? 'document.readyState'
     : visible
@@ -1556,6 +1579,35 @@ async function runBrowserDaemon() {
   // This mirrors exactly what Puppeteer does, which is why chrome-devtools-mcp
   // never triggers the "Allow debugging?" popup.
 
+  // Network idle tracking (per session), mirroring browser-harness
+  // wait_for_network_idle: track in-flight request ids per session so
+  // `wait --network-idle` can observe quiet windows. Attach paths enable the
+  // Network domain (see below) so events are complete from navigation start —
+  // CDP does not replay events that fired before Network.enable.
+  const networkTrackers = new Map(); // sessionId -> { inflight:Set, lastActivity:number }
+  cdp.networkTrackers = networkTrackers; // exposed to waitStr (module-level fn)
+  function ensureNetworkTracker(sessionId, now = Date.now()) {
+    let t = networkTrackers.get(sessionId);
+    if (!t) { t = { inflight: new Set(), lastActivity: now }; networkTrackers.set(sessionId, t); }
+    return t;
+  }
+  cdp.onEvent('Network.requestWillBeSent', (params, msg) => {
+    if (!msg.sessionId) return;
+    const t = ensureNetworkTracker(msg.sessionId);
+    t.inflight.add(params.requestId);
+    t.lastActivity = Date.now();
+  });
+  cdp.onEvent('Network.loadingFinished', (params, msg) => {
+    if (!msg.sessionId) return;
+    const t = networkTrackers.get(msg.sessionId);
+    if (t) { t.inflight.delete(params.requestId); t.lastActivity = Date.now(); }
+  });
+  cdp.onEvent('Network.loadingFailed', (params, msg) => {
+    if (!msg.sessionId) return;
+    const t = networkTrackers.get(msg.sessionId);
+    if (t) { t.inflight.delete(params.requestId); t.lastActivity = Date.now(); }
+  });
+
   // Level 2: when a page is attached from a tab session, store its sessionId
   cdp.onEvent('Target.attachedToTarget', async (params) => {
     const { sessionId, targetInfo } = params;
@@ -1576,6 +1628,9 @@ async function runBrowserDaemon() {
     } else if (targetInfo.type === 'page') {
       // Level 2 fired: a page was attached from a tab session → store it
       sessions.set(targetInfo.targetId, sessionId);
+      // Enable Network so idle tracking sees events from the start of any
+      // navigation that follows (CDP never replays pre-enable events).
+      cdp.send('Network.enable', {}, sessionId).catch(() => {});
     }
   });
 
@@ -1611,6 +1666,7 @@ async function runBrowserDaemon() {
       attach: async (tid) => {
         const res = await cdp.send('Target.attachToTarget', { targetId: tid, flatten: true });
         sessions.set(tid, res.sessionId);
+        cdp.send('Network.enable', {}, res.sessionId).catch(() => {});
         return res.sessionId;
       },
       targetId,
@@ -1663,33 +1719,40 @@ async function runBrowserDaemon() {
         }
         case 'open': {
           const url = args[0] || 'about:blank';
+
           // Reuse a blank tab (about:blank / new-tab page) when one exists —
           // never touch the user's real tabs.
           // Full enumeration including chrome:// pages so a real new-tab page
           // (chrome://newtab) is reusable; bypasses the shared filter cache.
           const tabsBefore = await getPages(cdp, { includeInternal: true });
-          const reusable = findReusableTab(tabsBefore);
+                    const reusable = findReusableTab(tabsBefore);
           let targetId;
           if (reusable) {
             targetId = reusable.targetId;
             await cdp.send('Target.activateTarget', { targetId });
-            const { sessionId } = await getSession(targetId);
-            await cdp.send('Page.enable', {}, sessionId);
-            await cdp.send('Page.navigate', { url }, sessionId);
-          } else {
+                        const { sessionId } = await getSession(targetId);
+                        await cdp.send('Page.enable', {}, sessionId);
+                        // Page.navigate can take ~12s to respond on never-ending (streaming)
+            // pages; the navigation itself is async, so don't block open on it.
+            const navP = cdp.send('Page.navigate', { url }, sessionId);
+            await Promise.race([navP, sleep(2000)]);
+            navP.catch(() => {});
+                      } else {
             // BH new_tab pattern: create blank, attach a session, THEN navigate.
             // createTarget({url}) navigates asynchronously — the tab stays on
             // about:blank for a while and Network/Runtime events for the early
             // navigation are missed (CDP does not replay them).
             ({ targetId } = await cdp.send('Target.createTarget', { url: 'about:blank' }));
-            // resolveSession's isKnownTarget check reads the TTL page cache —
+                        // resolveSession's isKnownTarget check reads the TTL page cache —
             // a just-created target is not in it, so refresh before attaching
             // (otherwise it throws "No target with given id found").
             await getPagesCached(true);
-            const { sessionId } = await getSession(targetId);
-            await cdp.send('Page.enable', {}, sessionId);
-            await cdp.send('Page.navigate', { url }, sessionId);
-          }
+                        const { sessionId } = await getSession(targetId);
+                        await cdp.send('Page.enable', {}, sessionId);
+                        const navP = cdp.send('Page.navigate', { url }, sessionId);
+            await Promise.race([navP, sleep(2000)]);
+            navP.catch(() => {});
+                      }
           const pageListStarted = Date.now();
           const { pages } = await getPagesCached(true);
           trace.pageListMs = Date.now() - pageListStarted;
@@ -2124,6 +2187,8 @@ Usage: cdp <command> [args]
                                     --visible: also require non-hidden and in-layout
   wait  <target> --load [--timeout <ms>]
                                     Wait for document.readyState == 'complete' (SPA-safe page load)
+  wait  <target> --network-idle [--timeout <ms>] [--idle <ms>]
+                                    Wait until no in-flight requests and quiet for idle ms (default 500)
   evalraw <target> <method> [json]  Send a raw CDP command; returns JSON result
                                     e.g. evalraw <t> "DOM.getDocument" '{}'
   open  [url]                       Open url in a blank tab if one exists (reused), else a new tab (default: about:blank)
