@@ -1677,7 +1677,18 @@ async function runBrowserDaemon() {
             await cdp.send('Page.enable', {}, sessionId);
             await cdp.send('Page.navigate', { url }, sessionId);
           } else {
-            ({ targetId } = await cdp.send('Target.createTarget', { url }));
+            // BH new_tab pattern: create blank, attach a session, THEN navigate.
+            // createTarget({url}) navigates asynchronously — the tab stays on
+            // about:blank for a while and Network/Runtime events for the early
+            // navigation are missed (CDP does not replay them).
+            ({ targetId } = await cdp.send('Target.createTarget', { url: 'about:blank' }));
+            // resolveSession's isKnownTarget check reads the TTL page cache —
+            // a just-created target is not in it, so refresh before attaching
+            // (otherwise it throws "No target with given id found").
+            await getPagesCached(true);
+            const { sessionId } = await getSession(targetId);
+            await cdp.send('Page.enable', {}, sessionId);
+            await cdp.send('Page.navigate', { url }, sessionId);
           }
           const pageListStarted = Date.now();
           const { pages } = await getPagesCached(true);
