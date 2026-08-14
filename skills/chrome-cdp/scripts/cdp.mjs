@@ -409,6 +409,8 @@ function getWsUrl() {
 // prompt for EVERY anonymous-origin connection. A fixed Origin header makes
 // the Allow grant sticky per origin, so the prompt fires once per Chrome
 // session instead of once per daemon restart.
+// Protocol limits (fine for CDP): no fragmentation reassembly, binary frames
+// ignored, no auto-ping. Close frames are echoed per 5.5.1.
 // Chrome 403s any Origin header without --remote-allow-origins; anonymous
 // connections get the Allow prompt instead. Keep Origin unset (per-connection
 // prompt is governed by the daemon staying alive, not by the header).
@@ -497,7 +499,8 @@ function wsConnect(wsUrl, { origin, timeoutMs = 10000 } = {}) {
         payload = Buffer.from(payload.map((b, i) => b ^ m[i % 4]));
       }
       buf = buf.slice(off + maskLen + len);
-      if (opcode === 0x8) { // close
+      if (opcode === 0x8) { // close: echo a close frame (RFC 6455 5.5.1), then end
+        try { sendFrame(0x8, payload); } catch {}
         ws.readyState = 3;
         ws.onclose?.();
         try { sock.end(); } catch {}
@@ -1555,19 +1558,20 @@ async function runBrowserDaemon() {
 
   const cdp = new CDP();
   log('daemon', 'starting, pid=', process.pid, 'socket=', sp);
-  // Patient connection, mirroring browser-harness _PatientCDPClient: ONE
-  // connection attempt stretched to a long timeout (theirs: 45s). Chrome 144+
-  // shows an "Allow debugging" popup per NEW WebSocket connection — retrying
-  // with fresh connections piles up popups (each attempt re-prompts), so we
-  // never reconnect inside a daemon lifetime. The CLI waits ~30s for the
-  // socket; click Allow within that window and the daemon comes up.
+  // Chrome 144+ shows an "Allow debugging" popup per NEW WebSocket connection.
+  // The daemon keeps one connection for its whole life; on failure it stays up
+  // and retries with exponential backoff (connectOnce below), so the modal is
+  // present for the user to click at any time instead of racing a command.
   let chromeConnected = false;
   let connectRetryTimer = null;
+  let connectInFlight = false;
+  let connectFails = 0;
   async function connectOnce() {
+    if (connectInFlight) return false; // serialise: connect+setAutoAttach can
+    // outlast a retry interval; a second connect would orphan the first socket.
+    connectInFlight = true;
     try {
       await cdp.connect(getWsUrl(), 8000);
-      chromeConnected = true;
-      log('daemon', 'connected to Chrome');
       await closeInspectTabs(cdp);
       await cdp.send('Target.setAutoAttach', {
         autoAttach: true,
@@ -1575,19 +1579,29 @@ async function runBrowserDaemon() {
         flatten: true,
         filter: [{ type: 'page', exclude: true }, {}],
       });
-      if (connectRetryTimer) { clearInterval(connectRetryTimer); connectRetryTimer = null; }
+      // chromeConnected set only after the connection is fully usable —
+      // otherwise a half-initialised connect leaves the daemon unable to
+      // retry (the retry guard checks chromeConnected).
+      chromeConnected = true;
+      connectFails = 0;
+      log('daemon', 'connected to Chrome');
+      if (connectRetryTimer) { clearTimeout(connectRetryTimer); connectRetryTimer = null; }
       return true;
     } catch (e) {
-      log('daemon', 'connect attempt failed (retrying):', e.message);
+      chromeConnected = false;
+      connectFails += 1;
+      log('daemon', 'connect attempt failed:', e.message);
+      // Exponential backoff (10s → 30s → 60s) so a dead/never-approved
+      // Chrome doesn't hammer new connections (each one is a new Allow prompt
+      // candidate) — while keeping the prompt alive for the user to click.
+      const delay = connectFails < 3 ? 10000 : connectFails < 6 ? 30000 : 60000;
+      connectRetryTimer = setTimeout(() => { if (!chromeConnected) connectOnce(); }, delay);
       return false;
+    } finally {
+      connectInFlight = false;
     }
   }
-  // Keep trying in the background so Chrome's Allow prompt stays up (one modal
-  // at a time); the user can click it whenever they see it, no race with a
-  // single command window.
-  connectOnce().then((ok) => {
-    if (!ok) connectRetryTimer = setInterval(() => { if (!chromeConnected) connectOnce(); }, 10000);
-  });
+  connectOnce();
 
   // sessions: targetId → sessionId
   // Populated via Target.attachedToTarget events (from setAutoAttach) + fallback attachToTarget
@@ -1856,9 +1870,16 @@ async function runBrowserDaemon() {
     log('daemon', 'waiting for Chrome connection (click "Allow debugging" in Chrome)');
     const deadline = Date.now() + 60000;
     while (!chromeConnected && Date.now() < deadline) await sleep(500);
-    if (!chromeConnected) throw new Error('Chrome connection pending — click "Allow debugging" in Chrome, then run this command again');
-    sessions.clear();
-    if (cdp.networkTrackers) cdp.networkTrackers.clear();
+    if (!chromeConnected) {
+      const up = isBrowserProcessRunning();
+      throw new Error(up
+        ? 'Chrome connection pending — click "Allow debugging" in Chrome, then run this command again'
+        : 'Chrome is not running — start Chrome with remote debugging (or run "cdp open" which launches it), then retry');
+    }
+    // NB: sessions/trackers are NOT cleared here — a connected-then-disconnected
+    // daemon shuts down (cdp.onClose → shutdown), so there is no reconnect path
+    // that would need a fresh map. Clearing here would only race the
+    // setAutoAttach flood.
   }
 
   // Handle a command; targetId is required for tab-specific commands
@@ -2030,6 +2051,18 @@ async function runBrowserDaemon() {
               case 'press':
                 commandResult = await pressStr(cdp, sessionId, args);
                 break;
+              case 'close':
+                // Target.closeTarget is browser-level; the session is only
+                // needed to confirm the target resolves (targetDestroyed
+                // cleans the sessions map). Force-refresh the page cache so
+                // the next list reflects the close immediately (TTL cache
+                // would otherwise show the dead tab for ~1.5s).
+                await cdp.send('Target.closeTarget', { targetId });
+                await getPagesCached(true);
+                return JSON.stringify({ targetId, closed: true });
+              case 'switch':
+                await cdp.send('Target.activateTarget', { targetId });
+                return JSON.stringify({ targetId, activated: true });
               default: throw new Error(`Unknown command: ${cmd}`);
             }
             trace.commandMs = Date.now() - commandStarted;
@@ -2265,7 +2298,8 @@ async function getOrStartBrowserDaemon() {
     child.unref();
     log('cli', 'daemon: spawned pid=', child.pid);
 
-    // Wait for socket (includes time for user to click Allow)
+    // Wait for the daemon's socket (the daemon itself handles the Chrome
+    // Allow prompt in the background — see connectOnce)
     for (let i = 0; i < DAEMON_CONNECT_RETRIES; i++) {
       await sleep(DAEMON_CONNECT_DELAY);
       try { return await connectToSocket(BROWSER_SOCK); } catch {}
@@ -2387,6 +2421,8 @@ Usage: cdp <command> [args]
   press <target> <key> [--ctrl|--shift|--alt|--meta]
                                     Dispatch a key press (Enter/Tab/Arrows/char...)
                                     with optional modifier combo
+  close <target>                    Close the tab
+  switch <target>                   Activate the tab (bring to foreground)
   evalraw <target> <method> [json]  Send a raw CDP command; returns JSON result
                                     e.g. evalraw <t> "DOM.getDocument" '{}'
   open  [url]                       Open url in a blank tab if one exists (reused), else a new tab (default: about:blank)
@@ -2426,7 +2462,7 @@ DAEMON IPC (for advanced use / scripting)
 
 const NEEDS_TARGET = new Set([
   'inspect','snap','snapshot','eval','shot','screenshot','html','nav','navigate',
-  'net','network','click','clickxy','type','loadall','evalraw','wait','press',
+  'net','network','click','clickxy','type','loadall','evalraw','wait','press','close','switch',
 ]);
 
 async function main() {

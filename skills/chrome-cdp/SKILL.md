@@ -10,7 +10,9 @@ Lightweight Chrome DevTools Protocol CLI. Connects directly via WebSocket — no
 ## Prerequisites
 
 - Chrome (or Chromium, Brave, Edge, Vivaldi) with remote debugging enabled: open `chrome://inspect/#remote-debugging` and toggle the switch
-- Node.js 22+ (uses built-in WebSocket)
+- Node.js 22+ (uses a hand-rolled RFC 6455 WebSocket client — zero deps; the
+  built-in WebSocket can't set request headers, and a fixed Origin header gets
+  403 from Chrome without --remote-allow-origins)
 - If your browser's `DevToolsActivePort` is in a non-standard location, set `CDP_PORT_FILE` to its full path
 - Set `CDP_HOST` if Chrome's debugging socket is not reachable on `127.0.0.1`
 
