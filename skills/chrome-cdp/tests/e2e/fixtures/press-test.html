@@ -8,9 +8,14 @@
 </form>
 <script>
   window.__keys = [];
+  window.__keyups = [];
   document.addEventListener('keydown', function (e) {
     var m = (e.ctrlKey ? '+ctrl' : '') + (e.shiftKey ? '+shift' : '') + (e.metaKey ? '+meta' : '') + (e.altKey ? '+alt' : '');
     window.__keys.push(e.key + m);
+  });
+  document.addEventListener('keyup', function (e) {
+    var m = (e.ctrlKey ? '+ctrl' : '') + (e.shiftKey ? '+shift' : '') + (e.metaKey ? '+meta' : '') + (e.altKey ? '+alt' : '');
+    window.__keyups.push(e.key + m);
   });
 </script>
 </body></html>

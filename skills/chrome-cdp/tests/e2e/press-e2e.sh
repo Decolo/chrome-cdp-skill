@@ -8,6 +8,7 @@
 #  5. validation: unknown key / missing key errors
 cd "$(dirname "$0")/../.."
 source tests/e2e/lib.sh
+e2e_isolated_setup
 E2E_NAME="press (B1)"
 
 start_slow_server
@@ -51,13 +52,25 @@ A=$($CDP eval "$T" "document.getElementById('a').value" 2>/dev/null)
 B=$($CDP eval "$T" "document.getElementById('b').value" 2>/dev/null)
 [ "$A" = "hix" ] && [ "$B" = "y" ] && ok "focus moved: a=\"$A\" b=\"$B\"" || bad "got a=$A b=$B"
 
-echo "=== 场景4：修饰键组合（Ctrl+A）==="
+echo "=== 场景4：修饰键组合（Ctrl+A 抑制 char + keyup 验证）==="
 $CDP press "$T" a --ctrl >/dev/null 2>&1
 sleep 0.3
 K=$($CDP eval "$T" "window.__keys[window.__keys.length-1]" 2>/dev/null)
 [ "$K" = "a+ctrl" ] && ok "keydown record = \"a+ctrl\"" || bad "got: $K"
+KU=$($CDP eval "$T" "window.__keyups[window.__keyups.length-1]" 2>/dev/null)
+[ "$KU" = "a+ctrl" ] && ok "keyup record = \"a+ctrl\"" || bad "got: $KU"
+V=$($CDP eval "$T" "document.getElementById('a').value" 2>/dev/null)
+[ "$V" = "hix" ] && ok "Ctrl+A 抑制 char：value 不变" || bad "value changed: $V"
 
-echo "=== 场景5：参数校验 ==="
+echo "=== 场景5：编辑键 Backspace（焦点在 b）==="
+$CDP press "$T" Backspace >/dev/null 2>&1
+sleep 0.3
+V=$($CDP eval "$T" "document.getElementById('b').value" 2>/dev/null)
+[ "$V" = "" ] && ok "Backspace 删除 b 的字符 (b=空)" || bad "got b: $V"
+KU=$($CDP eval "$T" "window.__keyups[window.__keyups.length-1]" 2>/dev/null)
+[ "$KU" = "Backspace" ] && ok "Backspace keyup 记录" || bad "got: $KU"
+
+echo "=== 场景6：参数校验 ==="
 E=$($CDP press "$T" 2>&1 | tail -1)
 case "$E" in
   *"key required"*) ok "缺 key 报错" ;;

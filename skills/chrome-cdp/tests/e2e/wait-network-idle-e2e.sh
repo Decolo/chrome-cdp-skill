@@ -9,6 +9,7 @@
 #  4. argument validation: --network-idle+--load / +selector / +--visible
 cd "$(dirname "$0")/../.."
 source tests/e2e/lib.sh
+e2e_isolated_setup
 E2E_NAME="wait --network-idle (A3)"
 
 start_slow_server

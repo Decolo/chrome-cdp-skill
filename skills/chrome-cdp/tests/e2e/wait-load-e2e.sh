@@ -8,6 +8,7 @@
 #  4. argument validation: selector+--load, --load+--visible, no args
 cd "$(dirname "$0")/../.."
 source tests/e2e/lib.sh
+e2e_isolated_setup
 E2E_NAME="wait --load (A2)"
 
 start_slow_server

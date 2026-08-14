@@ -7,6 +7,7 @@
 #  4. display:none element --visible -> false; after show -> true
 cd "$(dirname "$0")/../.."
 source tests/e2e/lib.sh
+e2e_isolated_setup
 E2E_NAME="wait (A1)"
 
 FIXTURE_PORT=9123

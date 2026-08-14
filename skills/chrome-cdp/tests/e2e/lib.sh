@@ -44,3 +44,28 @@ summary() {
   echo "=== $E2E_NAME e2e: PASS=$PASS FAIL=$FAIL ==="
   [ $FAIL -eq 0 ]
 }
+
+# --- Isolated mode (default) -----------------------------------------------
+# e2e NEVER touches the user's Chrome. It launches a throwaway Chrome with a
+# temp profile + --remote-allow-origins=* (zero Allow prompts) and a throwaway
+# daemon runtime dir (own socket/pid/log). Set E2E_LIVE=1 to run against the
+# user's real Chrome instead (acceptance only; will prompt once per session).
+e2e_isolated_setup() {
+  [ -n "$E2E_LIVE" ] && return
+  export XDG_RUNTIME_DIR="$(mktemp -d /tmp/cdp-e2e-runtime.XXXXXX)"
+  export CDP_USER_DATA_DIR="$(mktemp -d /tmp/cdp-e2e-profile.XXXXXX)"
+  local bin="${CDP_CHROME_PATH:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}"
+  "$bin" --remote-debugging-port=0 --user-data-dir="$CDP_USER_DATA_DIR"     --remote-allow-origins='*' --no-first-run --no-default-browser-check     --disable-background-networking about:blank >/dev/null 2>&1 &
+  E2E_CHROME_PID=$!
+  local f="$CDP_USER_DATA_DIR/DevToolsActivePort"
+  for i in $(seq 1 60); do [ -f "$f" ] && break; sleep 0.25; done
+  if [ ! -f "$f" ]; then echo "✖ isolated Chrome did not open a debug port"; exit 1; fi
+  export CDP_PORT_FILE="$f"
+  trap 'e2e_isolated_teardown' EXIT
+}
+e2e_isolated_teardown() {
+  "$CDP" stop 2>/dev/null
+  kill "$E2E_CHROME_PID" 2>/dev/null
+  sleep 0.5
+  rm -rf "$XDG_RUNTIME_DIR" "$CDP_USER_DATA_DIR" 2>/dev/null
+}
