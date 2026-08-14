@@ -828,12 +828,13 @@ async function getPages(cdp, { includeInternal = false } = {}) {
   return targetInfos.filter(t => t.type === 'page' && (includeInternal || !t.url.startsWith('chrome://')));
 }
 
-function formatPageList(pages) {
+function formatPageList(pages, currentTargetId) {
   const prefixLen = getDisplayPrefixLength(pages.map(p => p.targetId));
   return pages.map(p => {
     const id = p.targetId.slice(0, prefixLen).padEnd(prefixLen);
     const title = p.title.substring(0, 54).padEnd(54);
-    return `${id}  ${title}  ${p.url}`;
+    const mark = p.targetId === currentTargetId ? '  *' : '';
+    return `${id}  ${title}  ${p.url}${mark}`;
   }).join('\n');
 }
 
@@ -1913,6 +1914,7 @@ async function runBrowserDaemon() {
   // Clean up sessions when targets go away
   cdp.onEvent('Target.targetDestroyed', (params) => {
     sessions.delete(params.targetId);
+    for (const [k, v] of agentSessions) if (v === params.targetId) agentSessions.delete(k);
     clearTargetResolutionCache();
   });
   cdp.onEvent('Target.detachedFromTarget', (params) => {
@@ -1963,7 +1965,14 @@ async function runBrowserDaemon() {
   }
 
   // Handle a command; targetId is required for tab-specific commands
-  async function runCommand({ cmd, targetId, args }) {
+  // Session-scoped current tab (F1-F5): each agent session (CDP_SESSION env or
+// --session flag, 'default' when absent) remembers the tab it is working on.
+// Set by `open`/`switch`; consumed when a command omits <target>; cleared on
+// close/targetDestroyed/attach-failure so stale pointers never linger.
+const agentSessions = new Map();
+
+async function runCommand({ cmd, targetId, args, session }) {
+    const sid = session || 'default';
     if (cmd !== 'stats' && cmd !== 'stop') {
       try { await ensureChrome(); }
       catch (e) { return { ok: false, error: e.message }; }
@@ -1985,7 +1994,7 @@ async function runBrowserDaemon() {
           const { pages, cacheStatus } = await getPagesCached();
           trace.pageListMs = Date.now() - pageListStarted;
           trace.pageCacheStatus = cacheStatus;
-          result = formatPageList(pages);
+          result = formatPageList(pages, agentSessions.get(sid));
           break;
         }
         case 'list_raw': {
@@ -1994,6 +2003,21 @@ async function runBrowserDaemon() {
           trace.pageListMs = Date.now() - pageListStarted;
           trace.pageCacheStatus = cacheStatus;
           result = JSON.stringify(pages);
+          break;
+        }
+        case 'current': {
+          // BH current_tab: the tab this session is working on.
+          const cur = agentSessions.get(sid);
+          if (!cur) {
+            return { ok: false, error: `no current tab for session "${sid}" — run 'cdp switch <target> [--session <id>]' first`, trace };
+          }
+          const { pages } = await getPagesCached();
+          const p = pages.find(x => x.targetId === cur);
+          if (!p) {
+            agentSessions.delete(sid);
+            return { ok: false, error: `current tab for session "${sid}" is gone (closed or crashed) — run 'cdp switch <target> [--session <id>]' again`, trace };
+          }
+          result = JSON.stringify({ targetId: cur, url: p.url, title: p.title, session: sid });
           break;
         }
         case 'stats': {
@@ -2046,6 +2070,9 @@ async function runBrowserDaemon() {
             await Promise.race([navP, sleep(2000)]);
             navP.catch(() => {});
                       }
+          // The opened tab becomes this session's current tab (BH new_tab
+          // attaches and makes the tab current).
+          agentSessions.set(sid, targetId);
           const pageListStarted = Date.now();
           const { pages } = await getPagesCached(true);
           trace.pageListMs = Date.now() - pageListStarted;
@@ -2067,7 +2094,31 @@ async function runBrowserDaemon() {
         }
         case 'stop': return { ok: true, result: '', stopAfter: true };
         default: {
-          if (!targetId) return { ok: false, error: 'targetId required for this command' };
+          if (cmd === 'switch' && !targetId) {
+            return { ok: false, error: 'target required for switch — e.g. cdp switch <target> [--session <id>]', trace };
+          }
+          if (!targetId) {
+            // Session current-tab resolution: commands may omit <target> and
+            // act on the session's current tab. args[0] counts as an explicit
+            // target only when it looks like one (hex prefix, not a flag);
+            // otherwise it is a command argument (js/selector/url/...).
+            const a0 = args[0];
+            if (a0 && !a0.startsWith('-') && /^[0-9A-Fa-f]{6,}$/.test(a0)) {
+              try {
+                const resolved = await resolveTargetPrefix(a0);
+                targetId = resolved.targetId;
+                args.shift();
+              } catch (e) {
+                return { ok: false, error: e.message, trace };
+              }
+            } else {
+              const cur = agentSessions.get(sid);
+              if (!cur) {
+                return { ok: false, error: `no current tab for session "${sid}" — run 'cdp switch <target> [--session <id>]' first`, trace };
+              }
+              targetId = cur;
+            }
+          }
           let session;
           try {
             const setupStarted = Date.now();
@@ -2076,6 +2127,7 @@ async function runBrowserDaemon() {
             trace.attachMs = session.attachMs;
             trace.attachMode = session.attachMode;
           } catch (e) {
+            if (agentSessions.get(sid) === targetId) agentSessions.delete(sid);
             return { ok: false, error: `Failed to attach to tab: ${e.message}`, trace };
           }
           // Execute command; on session error, evict cache and retry once
@@ -2138,11 +2190,13 @@ async function runBrowserDaemon() {
                 // the next list reflects the close immediately (TTL cache
                 // would otherwise show the dead tab for ~1.5s).
                 await cdp.send('Target.closeTarget', { targetId });
+                for (const [k, v] of agentSessions) if (v === targetId) agentSessions.delete(k);
                 await getPagesCached(true);
                 return JSON.stringify({ targetId, closed: true });
               case 'switch':
+                agentSessions.set(sid, targetId);
                 await cdp.send('Target.activateTarget', { targetId });
-                return JSON.stringify({ targetId, activated: true });
+                return JSON.stringify({ targetId, activated: true, session: sid });
               case 'fill':
                 commandResult = await fillStr(cdp, sessionId, args);
                 break;
@@ -2498,7 +2552,8 @@ const USAGE = `cdp - lightweight Chrome DevTools Protocol CLI (no Puppeteer)
 
 Usage: cdp <command> [args]
 
-  list                              List open pages (shows unique target prefixes)
+  list [--session <id>]             List open pages; * marks this session's current tab
+  current [--session <id>]          Show this session's current tab (BH current_tab)
   stats                             Show browser daemon health and recent command timings
   inspect <target> [selector] [--limit <n>] [--sections a,b,c] [--text-max <n>] [--no-text]
                                     Lightweight page summary with optional section/output scoping
@@ -2547,6 +2602,16 @@ Usage: cdp <command> [args]
 <target> is a unique targetId prefix from "cdp list". If a prefix is ambiguous,
 use more characters.
 
+SESSIONS (current tab)
+  Each agent session remembers the tab it is working on. Session id comes from
+  --session <id> (any position) or env CDP_SESSION; without either, "default".
+  'open' and 'switch' set the session's current tab. Page commands may then
+  OMIT <target> and act on that tab:  cdp eval "js"   cdp wait --load
+  cdp wait "#x" --visible   cdp close   cdp ensure-real-tab
+  An explicit hex prefix still wins; a <target>-less command with no current
+  tab errors with a hint to run switch first. Multiple subagents can each
+  operate on their own tab via different session ids.
+
 COORDINATE SYSTEM
   shot captures the viewport at the device's native resolution by default.
   Use --selector for an element-scoped screenshot or --clip for a CSS-pixel region.
@@ -2568,12 +2633,12 @@ EVAL SAFETY NOTE
 DAEMON IPC (for advanced use / scripting)
   A single browser daemon runs at Unix socket in the runtime dir (see below).
   Protocol: newline-delimited JSON (one JSON object per line, UTF-8).
-    Request:  {"id":<number>, "cmd":"<command>", "targetId":"<id>", "args":["arg1","arg2",...]}
+    Request:  {"id":<number>, "cmd":"<command>", "targetId":"<id>", "args":["arg1","arg2",...], "session":"<id>"}
     Response: {"id":<number>, "ok":true,  "result":"<string>"}
            or {"id":<number>, "ok":false, "error":"<message>"}
   Commands mirror the CLI: stats, inspect, snap, eval, shot, html, nav, net,
   click, clickxy, type, loadall, wait, press, close, switch, fill, scroll,
-  upload, ensure-real-tab, evalraw, stop. Use evalraw to send arbitrary CDP methods.
+  upload, ensure-real-tab, current, evalraw, stop. Use evalraw to send arbitrary CDP methods.
   The socket disappears when Chrome disconnects or after "cdp stop".
 `;
 
@@ -2594,9 +2659,30 @@ async function main() {
     console.log(USAGE); process.exit(0);
   }
 
+  // Session id: --session <id> / --session=<id> (any position) wins over env
+  // CDP_SESSION; when neither is present the daemon uses "default". Sessions
+  // isolate the "current tab" per agent (multiple subagents, different tabs).
+  let session = process.env.CDP_SESSION || undefined;
+  {
+    const kept = [];
+    for (let i = 0; i < args.length; i++) {
+      const a = args[i];
+      if (a === '--session') {
+        if (i + 1 >= args.length) { console.error('Error: --session requires a value'); process.exit(1); }
+        session = args[++i];
+      } else if (a.startsWith('--session=')) {
+        session = a.slice('--session='.length);
+      } else {
+        kept.push(a);
+      }
+    }
+    args.length = 0;
+    args.push(...kept);
+  }
+
   if (cmd === 'list' || cmd === 'ls') {
     const conn = await getOrStartBrowserDaemon();
-    const response = await sendCommand(conn, { cmd: 'list', args: [] });
+    const response = await sendCommand(conn, { cmd: 'list', args: [], session });
     if (!response.ok) { console.error('Error:', response.error); process.exit(1); }
     console.log(response.result);
     return;
@@ -2607,6 +2693,15 @@ async function main() {
     const response = await sendCommand(conn, { cmd: 'stats', args: [] });
     if (!response.ok) { console.error('Error:', response.error); process.exit(1); }
     console.log(response.result);
+    return;
+  }
+
+  // Current tab for this session (BH current_tab)
+  if (cmd === 'current') {
+    const conn = await getOrStartBrowserDaemon();
+    const response = await sendCommand(conn, { cmd: 'current', args: [], session });
+    if (!response.ok) { console.error('Error:', response.error); process.exit(1); }
+    console.log(response.result); // JSON: {targetId, url, title, session}
     return;
   }
 
@@ -2626,7 +2721,7 @@ async function main() {
       console.error('Error:', e.message);
       process.exit(1);
     }
-    const response = await sendCommand(conn, { cmd: 'open', args: [url] });
+    const response = await sendCommand(conn, { cmd: 'open', args: [url], session });
     if (!response.ok) { console.error('Error:', response.error); process.exit(1); }
     const { targetId, reusedTab } = JSON.parse(response.result);
     console.log(
@@ -2650,14 +2745,19 @@ async function main() {
     process.exit(1);
   }
 
-  const targetPrefix = args[0];
-  if (!targetPrefix) {
-    console.error('Error: target ID required. Run "cdp list" first.');
+  // Target handling: an explicit target is a hex prefix (>= 6 chars, not a
+  // flag). Anything else means the command acts on this session's current tab
+  // (daemon-side resolution) — e.g. `cdp eval "js"`, `cdp wait --load`,
+  // `cdp wait "#x" --visible`, `cdp close --session A`.
+  const a0 = args[0];
+  const explicitTarget = a0 && !a0.startsWith('-') && /^[0-9A-Fa-f]{6,}$/.test(a0);
+  if (cmd === 'switch' && !explicitTarget) {
+    console.error('Error: switch requires a target — e.g. "cdp switch <target> [--session <id>]"');
     process.exit(1);
   }
 
   const conn = await getOrStartBrowserDaemon();
-  const cmdArgs = args.slice(1);
+  const cmdArgs = explicitTarget ? args.slice(1) : args;
 
   if (cmd === 'eval') {
     const expr = cmdArgs.join(' ');
@@ -2679,16 +2779,19 @@ async function main() {
     process.exit(1);
   }
 
-  // One connection, two round trips: resolve the target prefix, then run the
-  // command. The daemon's response for resolve_target carries the full id.
-  const resolved = await sendCommand(conn, { cmd: 'resolve_target', args: [targetPrefix] }, { close: false });
-  if (!resolved.ok) {
-    console.error('Error:', resolved.error);
-    process.exit(1);
+  let targetId = null;
+  if (explicitTarget) {
+    // One connection, two round trips: resolve the target prefix, then run the
+    // command. The daemon's response for resolve_target carries the full id.
+    const resolved = await sendCommand(conn, { cmd: 'resolve_target', args: [a0] }, { close: false });
+    if (!resolved.ok) {
+      console.error('Error:', resolved.error);
+      process.exit(1);
+    }
+    targetId = JSON.parse(resolved.result).targetId;
   }
-  const targetId = JSON.parse(resolved.result).targetId;
 
-  const response = await sendCommand(conn, { cmd, targetId, args: cmdArgs });
+  const response = await sendCommand(conn, { cmd, targetId, args: cmdArgs, session });
 
   if (response.ok) {
     if (response.result) console.log(response.result);

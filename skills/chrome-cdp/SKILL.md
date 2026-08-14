@@ -86,10 +86,14 @@ scripts/cdp.mjs fill    <target> <selector> <text...> [--no-clear] [--timeout ms
 scripts/cdp.mjs scroll  <target> <x> <y> [--dy px] [--dx px]  # wheel-scroll at viewport coords (default dy=-300)
 scripts/cdp.mjs upload  <target> <selector> <path>  # set files on a file input (DOM.setFileInputFiles)
 scripts/cdp.mjs ensure-real-tab <target>        # if tab is internal (chrome:// etc.), switch to the first real tab
+scripts/cdp.mjs close   <target>                  # close the tab; without <target>: close the session's current tab
+scripts/cdp.mjs switch  <target> [--session <id>] # activate tab + set it as this session's current tab
+scripts/cdp.mjs current [--session <id>]          # this session's current tab {targetId,url,title}
 scripts/cdp.mjs evalraw <target> <method> [json]  # raw CDP command passthrough
-scripts/cdp.mjs open    [url]                  # open url in a blank tab if one exists (reused), else a new tab
-scripts/cdp.mjs list                              # reuses the single browser daemon; auto-launches
-                                                    Chrome with remote debugging if it is not running
+scripts/cdp.mjs open    [url] [--session <id>]    # open url in a blank tab if one exists (reused), else a new tab;
+                                                    the opened tab becomes this session's current tab
+scripts/cdp.mjs list    [--session <id>]          # tabs; * marks this session's current tab (reuses the single
+                                                    browser daemon; auto-launches Chrome with remote debugging if not running)
 scripts/cdp.mjs stats                          # daemon health and recent command timings
 scripts/cdp.mjs stop                           # stop the browser daemon
 ```
@@ -114,6 +118,7 @@ CSS px = screenshot image px / DPR
 - Use `stats` to spot commands that are setup-heavy or return unusually large payloads, not just slow ones.
 - `nav` only waits for `readyState=complete` — SPAs render after that. Use `wait <target> <selector>` after actions that trigger async rendering (route changes, data fetches); add `--visible` when the element may exist hidden in the DOM.
 - `wait --load` reports the current document's readyState. After `open`, navigation is async: the new tab briefly stays on `about:blank` whose readyState is already `complete`, so `wait --load` right after `open` can false-positive on the pre-navigation document. Reliable patterns: use `nav` (which gates on the load event) or poll `location.href` first (as the e2e scripts do).
+- **Sessions (current tab)**: each agent session remembers the tab it works on — `open`/`switch` set it, and page commands may then omit `<target>` and act on that tab (`cdp eval "js"`, `cdp wait --load`, `cdp close`, `cdp ensure-real-tab`). The session id comes from `--session <id>` (any position) or the `CDP_SESSION` env var; without either, `default`. Give each subagent a distinct `CDP_SESSION` so several agents can operate different tabs concurrently. An explicit hex target still wins; a target-less command with no current tab errors with a hint to run `switch` first. Mirrors browser-harness's `current_tab` model, but scoped per session.
 - `press` follows browser-harness `press_key` semantics: keyDown → char (printable only, and only when no Alt/Ctrl/Meta modifier) → keyUp, with BH's virtual-key table (Enter=13/\r, Tab=9/\t, Backspace, Escape, Delete, Space, Arrows, Home/End, PageUp/PageDown). Modifiers are the BH bitfield (1=Alt 2=Ctrl 4=Meta 8=Shift); Alt/Ctrl/Meta turn a single key into a shortcut (no char event). Enter carries text `\r` so form submissions fire; Tab carries `\t` so focus moves. e.keyCode comes from the BH ord() mapping (single chars pass their ASCII code, e.g. 'a'→97).
 - `fill` follows browser-harness `fill_input`: focus → clear (JS `select()` + Backspace) → per-char real key events → synthetic `input`+`change` events. Use it where `type` (Input.insertText) is ignored — React controlled inputs, Vue v-model, Ember tracked fields: insertText bypasses framework listeners, so submit buttons stay disabled. Note BH's select-all-via-Cmd/Ctrl+A shortcut does not work through CDP at all (synthetic key events never trigger Chrome's select-all edit command, and background tabs receive no edit commands); `select()` is deterministic in both.
 - `wait --network-idle` is the SPA-safe counterpart of `--load`: readyState becomes `complete` before framework XHR/fetch settle. It tracks in-flight requests per tab (Network domain enabled at attach, events never replayed — attach happens before navigation, so tracking is complete from navigation start). Long-lived connections (SSE/keepalive/streaming) keep the page busy forever — the wait then times out with `inflight: n`; this matches browser-harness semantics.
