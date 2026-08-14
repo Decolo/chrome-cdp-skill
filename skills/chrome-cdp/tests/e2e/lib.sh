@@ -55,7 +55,13 @@ e2e_isolated_setup() {
   export XDG_RUNTIME_DIR="$(mktemp -d /tmp/cdp-e2e-runtime.XXXXXX)"
   export CDP_USER_DATA_DIR="$(mktemp -d /tmp/cdp-e2e-profile.XXXXXX)"
   local bin="${CDP_CHROME_PATH:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}"
-  "$bin" --remote-debugging-port=0 --user-data-dir="$CDP_USER_DATA_DIR"     --remote-allow-origins='*' --no-first-run --no-default-browser-check     --disable-background-networking about:blank >/dev/null 2>&1 &
+  # E2E_HEADLESS=1: headless=new (no window). Needed for JS-dialog tests —
+  # a windowed Chrome whose window never gets OS focus auto-suppresses
+  # alert/confirm/prompt (auto-dismiss without freezing JS), so
+  # Page.javascriptDialogOpening never fires.
+  local headless=""
+  [ -n "$E2E_HEADLESS" ] && headless="--headless=new"
+  "$bin" $headless --remote-debugging-port=0 --user-data-dir="$CDP_USER_DATA_DIR"     --remote-allow-origins='*' --no-first-run --no-default-browser-check     --disable-background-networking about:blank >/dev/null 2>&1 &
   E2E_CHROME_PID=$!
   local f="$CDP_USER_DATA_DIR/DevToolsActivePort"
   for i in $(seq 1 60); do [ -f "$f" ] && break; sleep 0.25; done

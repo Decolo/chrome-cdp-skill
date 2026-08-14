@@ -1930,6 +1930,27 @@ async function runBrowserDaemon() {
     }
   });
 
+  // Pending JS dialog (alert/confirm/prompt/beforeunload). Dialogs freeze
+  // the page's JS thread; Page.javascriptDialogOpening arrives on the page's
+  // session (needs Page.enable at attach — see getSession). Only the tab that
+  // opened the dialog is blocked, so we record its targetId.
+  let pendingDialog = null;
+  cdp.onEvent('Page.javascriptDialogOpening', (params, msg) => {
+    let targetId = null;
+    for (const [tid, sid] of sessions) {
+      if (sid === msg.sessionId) { targetId = tid; break; }
+    }
+    pendingDialog = {
+      type: params.type,
+      message: params.message,
+      hasTouch: !!params.hasTouch,
+      defaultPrompt: params.defaultPrompt,
+      sessionId: msg.sessionId,
+      targetId,
+    };
+  });
+  cdp.onEvent('Page.javascriptDialogClosed', () => { pendingDialog = null; });
+
   // Clean up sessions when targets go away
   cdp.onEvent('Target.targetDestroyed', (params) => {
     sessions.delete(params.targetId);
@@ -1958,6 +1979,7 @@ async function runBrowserDaemon() {
         const res = await cdp.send('Target.attachToTarget', { targetId: tid, flatten: true });
         sessions.set(tid, res.sessionId);
         cdp.send('Network.enable', {}, res.sessionId).catch(() => {});
+        cdp.send('Page.enable', {}, res.sessionId).catch(() => {});
         return res.sessionId;
       },
       targetId,
@@ -2043,6 +2065,120 @@ async function runCommand({ cmd, targetId, args, session }) {
             }
             result = JSON.stringify({ targetId: m.targetId, url: m.url, title: m.title });
           }
+          break;
+        }
+        case 'dialog': {
+          // L2 dialogs (BH interaction-skills/dialogs.md): query or handle the
+          // pending JS dialog. Dialogs freeze the page; commands on that tab
+          // are blocked with a hint while one is pending (see default case).
+          const action = args[0];
+          if (action && action !== 'accept' && action !== 'dismiss') {
+            return { ok: false, error: `unknown dialog action: "${action}" (accept|dismiss)`, trace };
+          }
+          if (!pendingDialog) {
+            result = JSON.stringify({ dialog: null });
+            break;
+          }
+          if (!action) {
+            result = JSON.stringify({
+              dialog: {
+                type: pendingDialog.type,
+                message: pendingDialog.message,
+                hasTouch: pendingDialog.hasTouch,
+                defaultPrompt: pendingDialog.defaultPrompt,
+              },
+            });
+            break;
+          }
+          const promptText = args.find((a, i) => i > 0 && args[i - 1] === '--prompt-text');
+          const dialog = { type: pendingDialog.type, message: pendingDialog.message };
+          await cdp.send('Page.handleJavaScriptDialog', {
+            accept: action === 'accept',
+            ...(action === 'accept' && promptText !== undefined ? { promptText } : {}),
+          }, pendingDialog.sessionId);
+          pendingDialog = null;
+          result = JSON.stringify({ handled: true, dialog, action });
+          break;
+        }
+        case 'cookies': case 'cookie': {
+          // L2 cookies (BH interaction-skills/cookies.md): list/set/delete +
+          // save/load a JSON snapshot (session restore across tasks).
+          // Cookie APIs live on a page session (the browser endpoint does not
+          // register the Network/Storage domains), so route through the
+          // session's current tab, else the first attached page.
+          let pageSession = null;
+          const cur = agentSessions.get(sid);
+          if (cur) pageSession = sessions.get(cur) || null;
+          if (!pageSession) {
+            const { pages } = await getPagesCached();
+            for (const pg of pages) {
+              pageSession = sessions.get(pg.targetId) || null;
+              if (pageSession) break;
+            }
+          }
+          if (!pageSession) {
+            return { ok: false, error: 'no page available for cookie operations — open a tab first', trace };
+          }
+          const sub = cmd === 'cookie' ? args[0] : undefined;
+          const rest = cmd === 'cookie' ? args.slice(1) : args;
+          const flagVal = (name) => {
+            const i = rest.indexOf(name);
+            return i >= 0 ? rest[i + 1] : undefined;
+          };
+          const hasFlag = (name) => rest.includes(name);
+
+          if (cmd === 'cookies') {
+            if (hasFlag('--save')) {
+              const file = flagVal('--save');
+              if (!file) return { ok: false, error: '--save requires a file path', trace };
+              const { cookies } = await cdp.send('Network.getAllCookies', {}, pageSession);
+              writeFileSync(file, JSON.stringify({ cookies }, null, 2));
+              result = JSON.stringify({ saved: file, count: cookies.length });
+              break;
+            }
+            if (hasFlag('--load')) {
+              const file = flagVal('--load');
+              if (!file) return { ok: false, error: '--load requires a file path', trace };
+              let data;
+              try { data = JSON.parse(readFileSync(file, 'utf8')); }
+              catch { return { ok: false, error: `cannot read cookie file: ${file}`, trace }; }
+              if (!Array.isArray(data.cookies)) return { ok: false, error: `invalid cookie file: ${file} (expected {cookies:[...]})`, trace };
+              for (const c of data.cookies) {
+                await cdp.send('Network.setCookie', { name: c.name, value: c.value, domain: c.domain, path: c.path || '/', ...(c.secure ? { secure: true } : {}), ...(c.httpOnly ? { httpOnly: true } : {}), ...(c.expires ? { expires: c.expires } : {}) }, pageSession).catch(() => {});
+              }
+              result = JSON.stringify({ loaded: file, count: data.cookies.length });
+              break;
+            }
+            const { cookies } = await cdp.send('Network.getAllCookies', {}, pageSession);
+            result = JSON.stringify(cookies);
+            break;
+          }
+
+          // cmd === 'cookie': set <name> <value> | delete <name>
+          const name = rest[0];
+          if (sub !== 'set' && sub !== 'delete') {
+            return { ok: false, error: 'usage: cookie set <name> <value> [--domain d] [--path p] [--secure] [--httpOnly] [--expires ts] | cookie delete <name> [--domain d]', trace };
+          }
+          if (!name) return { ok: false, error: `cookie ${sub} requires a name`, trace };
+          if (sub === 'delete') {
+            const r = await cdp.send('Network.deleteCookies', { name, ...(flagVal('--domain') ? { domain: flagVal('--domain') } : {}) }, pageSession);
+            result = JSON.stringify({ deleted: name, success: !!r.success });
+            break;
+          }
+          const value = rest[1];
+          if (value === undefined) return { ok: false, error: 'cookie set requires a value', trace };
+          const domain = flagVal('--domain');
+          if (!domain) return { ok: false, error: 'cookie set requires --domain <host> (or use eval to set a cookie for the current page)', trace };
+          const r = await cdp.send('Network.setCookie', {
+            name, value,
+            domain,
+            path: flagVal('--path') || '/',
+            ...(hasFlag('--secure') ? { secure: true } : {}),
+            ...(hasFlag('--httpOnly') ? { httpOnly: true } : {}),
+            ...(flagVal('--expires') ? { expires: Number(flagVal('--expires')) } : {}),
+          }, pageSession);
+          if (!r.success) return { ok: false, error: `cookie set failed (${r.errorMessage || 'unknown'})`, trace };
+          result = JSON.stringify({ set: { name, domain, path: flagVal('--path') || '/' } });
           break;
         }
         case 'current': {
@@ -2159,6 +2295,13 @@ async function runCommand({ cmd, targetId, args, session }) {
               targetId = cur;
             }
           }
+          if (pendingDialog && pendingDialog.targetId === targetId) {
+            return {
+              ok: false,
+              error: `page has a pending dialog (${pendingDialog.type}${pendingDialog.message ? `: ${pendingDialog.message.slice(0, 80)}` : ''}) — handle it with 'cdp dialog accept|dismiss' first`,
+              trace,
+            };
+          }
           let session;
           try {
             const setupStarted = Date.now();
@@ -2246,6 +2389,15 @@ async function runCommand({ cmd, targetId, args, session }) {
               case 'upload':
                 commandResult = await uploadStr(cdp, sessionId, args);
                 break;
+              case 'pdf': {
+                // L2 print-as-pdf: Page.printToPDF -> base64 -> file.
+                const file = args[0] || `${targetId.slice(0, 8)}.pdf`;
+                const res = await cdp.send('Page.printToPDF', { printBackground: true }, sessionId);
+                writeFileSync(file, Buffer.from(res.data, 'base64'));
+                const size = statSync(file).size;
+                commandResult = JSON.stringify({ file, size, targetId });
+                break;
+              }
               case 'ensure-real-tab': {
                 // BH ensure_real_tab: if the tab is an internal page (chrome://,
                 // about:, devtools://, chrome-extension://), switch to the first
@@ -2597,6 +2749,15 @@ Usage: cdp <command> [args]
   iframe [url-substr]               List cross-origin iframe targets, or resolve the first
                                     whose URL contains the substring; the id works with
                                     every page command (eval/click/inspect/...)
+  dialog [accept|dismiss] [--prompt-text <t>]
+                                    Query the pending JS dialog (alert/confirm/prompt/
+                                    beforeunload), or handle it; page commands on the
+                                    dialog's tab are blocked until handled
+  cookies [--save <file> | --load <file>]
+                                    List all cookies, or save/load a JSON snapshot
+  cookie set <name> <value> --domain <host> [--path /] [--secure] [--httpOnly] [--expires ts]
+  cookie delete <name> [--domain <host>]
+  pdf     <target> [file]           Print the page to a PDF file (default: <prefix>.pdf)
   stats                             Show browser daemon health and recent command timings
   inspect <target> [selector] [--limit <n>] [--sections a,b,c] [--text-max <n>] [--no-text]
                                     Lightweight page summary with optional section/output scoping
@@ -2681,14 +2842,15 @@ DAEMON IPC (for advanced use / scripting)
            or {"id":<number>, "ok":false, "error":"<message>"}
   Commands mirror the CLI: stats, inspect, snap, eval, shot, html, nav, net,
   click, clickxy, type, loadall, wait, press, close, switch, fill, scroll,
-  upload, ensure-real-tab, current, iframe, evalraw, stop. Use evalraw to send arbitrary CDP methods.
+  upload, ensure-real-tab, current, iframe, dialog, cookies, cookie, pdf, evalraw,
+  stop. Use evalraw to send arbitrary CDP methods.
   The socket disappears when Chrome disconnects or after "cdp stop".
 `;
 
 const NEEDS_TARGET = new Set([
   'inspect','snap','snapshot','eval','shot','screenshot','html','nav','navigate',
   'net','network','click','clickxy','type','loadall','evalraw','wait','press','close','switch',
-  'fill','scroll','upload','ensure-real-tab',
+  'fill','scroll','upload','ensure-real-tab','pdf',
 ]);
 
 async function main() {
@@ -2751,6 +2913,16 @@ async function main() {
     } else {
       console.log(`iframe: ${data.targetId.slice(0, 8)}  ${data.title}  ${data.url}`);
     }
+    return;
+  }
+
+  // L2 dialogs/cookies: no target needed (dialog state and cookies are
+  // browser-level).
+  if (cmd === 'dialog' || cmd === 'cookies' || cmd === 'cookie') {
+    const conn = await getOrStartBrowserDaemon();
+    const response = await sendCommand(conn, { cmd, args, session });
+    if (!response.ok) { console.error('Error:', response.error); process.exit(1); }
+    console.log(response.result);
     return;
   }
 

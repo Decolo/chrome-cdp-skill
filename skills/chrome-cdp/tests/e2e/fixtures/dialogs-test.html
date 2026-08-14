@@ -1,0 +1,8 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>dialogs-test</title></head>
+<body>
+  <button id="alert-btn" onclick="alert('hello alert')">alert</button>
+  <button id="confirm-btn" onclick="var r=confirm('sure?');document.getElementById('status').textContent='confirm:'+r">confirm</button>
+  <button id="prompt-btn" onclick="var r=prompt('name?','def');document.getElementById('status').textContent='prompt:'+r">prompt</button>
+  <div id="status">idle</div>
+</body></html>
