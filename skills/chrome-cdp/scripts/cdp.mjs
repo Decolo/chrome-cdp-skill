@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 // cdp - lightweight Chrome DevTools Protocol CLI
-// Uses raw CDP over WebSocket, no Puppeteer dependency.
-// Requires Node 22+ (built-in WebSocket).
+// Uses raw CDP over WebSocket, no Puppeteer dependency (hand-rolled RFC 6455
+// client so the Origin header is controllable — Chrome's "Allow debugging"
+// prompt is sticky per origin; without an Origin it re-prompts on every
+// connection).
 //
 // Single browser daemon: all page commands go through one daemon that holds
-// a single CDP WebSocket connection to Chrome. Chrome's "Allow debugging"
-// modal fires once per daemon (= once per Chrome session). Daemon lives
-// until Chrome disconnects or "cdp stop" is called.
+// a single CDP WebSocket connection to Chrome. Daemon lives until Chrome
+// disconnects or "cdp stop" is called.
 
 import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync, openSync, writeSync, closeSync, statSync, rmdirSync, appendFileSync } from 'fs';
 import { homedir } from 'os';
@@ -14,6 +15,7 @@ import { resolve } from 'path';
 import { pathToFileURL } from 'url';
 import { spawn, spawnSync, execFileSync } from 'child_process';
 import net from 'net';
+import { randomBytes, createHash } from 'crypto';
 
 const TIMEOUT = 15000;
 const NAVIGATION_TIMEOUT = 30000;
@@ -180,6 +182,10 @@ function defaultProfileBase() {
 function chromeLaunchArgs() {
   const dataDir = (process.env.CDP_USER_DATA_DIR || '').trim();
   const args = [];
+  // --remote-allow-origins=* disables Chrome 151's per-connection "Allow
+  // debugging" prompt for every CDP client we spawn (the prompt is sticky per
+  // connection without it; with it, connections are allowed outright).
+  args.push('--remote-allow-origins=*');
   if (dataDir) {
     args.push('--remote-debugging-port=0', `--user-data-dir=${dataDir}`);
   } else {
@@ -398,6 +404,118 @@ function getWsUrl() {
   return `ws://${host}:${lines[0]}${lines[1]}`;
 }
 
+// Minimal RFC 6455 WebSocket client (zero-dep). Node's built-in WebSocket
+// cannot set request headers, and Chrome 144+ shows the "Allow debugging"
+// prompt for EVERY anonymous-origin connection. A fixed Origin header makes
+// the Allow grant sticky per origin, so the prompt fires once per Chrome
+// session instead of once per daemon restart.
+// Chrome 403s any Origin header without --remote-allow-origins; anonymous
+// connections get the Allow prompt instead. Keep Origin unset (per-connection
+// prompt is governed by the daemon staying alive, not by the header).
+// const WS_ORIGIN = 'http://localhost';
+
+function wsConnect(wsUrl, { origin, timeoutMs = 10000 } = {}) {
+  const u = new URL(wsUrl);
+  const ws = { onopen: null, onerror: null, onclose: null, onmessage: null, readyState: 0 };
+  const key = randomBytes(16).toString('base64');
+  const req = [
+    `GET ${(u.pathname || '/') + (u.search || '')} HTTP/1.1`,
+    `Host: ${u.host}`,
+    'Upgrade: websocket',
+    'Connection: Upgrade',
+    `Sec-WebSocket-Key: ${key}`,
+    'Sec-WebSocket-Version: 13',
+    ...(origin ? [`Origin: ${origin}`] : []),
+    '', '',
+  ].join('\r\n');
+  const sock = net.createConnection({ host: u.hostname, port: Number(u.port) || 80 });
+  let buf = Buffer.alloc(0);
+  let handshaken = false;
+  const timer = setTimeout(() => {
+    try { sock.destroy(); } catch {}
+    ws.onerror?.({ message: 'CDP connect timeout' });
+  }, timeoutMs);
+  const sendFrame = (opcode, payload) => {
+    const data = Buffer.isBuffer(payload) ? payload : Buffer.from(payload);
+    const mask = randomBytes(4);
+    const masked = Buffer.from(data.map((b, i) => b ^ mask[i % 4]));
+    let header;
+    if (data.length < 126) header = Buffer.from([0x80 | opcode, 0x80 | data.length]);
+    else if (data.length < 65536) {
+      header = Buffer.alloc(4);
+      header[0] = 0x80 | opcode; header[1] = 0x80 | 126;
+      header.writeUInt16BE(data.length, 2);
+    } else {
+      header = Buffer.alloc(10);
+      header[0] = 0x80 | opcode; header[1] = 0x80 | 127;
+      header.writeBigUInt64BE(BigInt(data.length), 2);
+    }
+    sock.write(Buffer.concat([header, mask, masked]));
+  };
+  ws.send = (data) => { if (ws.readyState === 1) sendFrame(0x1, String(data)); };
+  ws.close = () => {
+    if (ws.readyState === 1) {
+      ws.readyState = 2;
+      try { sendFrame(0x8, Buffer.alloc(0)); } catch {}
+      setTimeout(() => { try { sock.destroy(); } catch {} }, 50);
+    }
+  };
+  sock.on('connect', () => sock.write(req));
+  sock.on('data', (chunk) => {
+    buf = Buffer.concat([buf, chunk]);
+    if (!handshaken) {
+      const idx = buf.indexOf('\r\n\r\n');
+      if (idx === -1) return;
+      const head = buf.slice(0, idx).toString('latin1');
+      buf = buf.slice(idx + 4);
+      const statusLine = head.split('\r\n')[0];
+      const expect = createHash('sha1').update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
+      const accept = head.split('\r\n').find(l => l.toLowerCase().startsWith('sec-websocket-accept:'));
+      if (!statusLine.includes(' 101 ') || !accept || accept.split(':')[1].trim() !== expect) {
+        clearTimeout(timer);
+        ws.onerror?.({ message: `handshake failed: ${statusLine}` });
+        try { sock.destroy(); } catch {}
+        return;
+      }
+      handshaken = true;
+      clearTimeout(timer);
+      ws.readyState = 1;
+      ws.onopen?.();
+    }
+    while (handshaken && buf.length >= 2) {
+      const opcode = buf[0] & 0x0f;
+      const masked = (buf[1] & 0x80) !== 0;
+      let len = buf[1] & 0x7f;
+      let off = 2;
+      if (len === 126) { if (buf.length < 4) break; len = buf.readUInt16BE(2); off = 4; }
+      else if (len === 127) { if (buf.length < 10) break; len = Number(buf.readBigUInt64BE(2)); off = 10; }
+      const maskLen = masked ? 4 : 0;
+      if (buf.length < off + maskLen + len) break;
+      let payload = buf.slice(off + maskLen, off + maskLen + len);
+      if (masked) {
+        const m = buf.slice(off, off + 4);
+        payload = Buffer.from(payload.map((b, i) => b ^ m[i % 4]));
+      }
+      buf = buf.slice(off + maskLen + len);
+      if (opcode === 0x8) { // close
+        ws.readyState = 3;
+        ws.onclose?.();
+        try { sock.end(); } catch {}
+        return;
+      } else if (opcode === 0x9) { // ping -> pong
+        sendFrame(0xA, payload);
+      } else if (opcode === 0x1 || opcode === 0x0) { // text / continuation
+        ws.onmessage?.({ data: payload.toString('utf8') });
+      }
+    }
+  });
+  sock.on('error', (e) => { if (!handshaken) { clearTimeout(timer); ws.onerror?.({ message: e.message }); } });
+  sock.on('close', () => {
+    if (ws.readyState !== 3) { ws.readyState = 3; ws.onclose?.(); }
+  });
+  return ws;
+}
+
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 
@@ -612,7 +730,7 @@ class CDP {
 
   async connect(wsUrl, timeoutMs = 8000) {
     return new Promise((res, rej) => {
-      this.#ws = new WebSocket(wsUrl);
+      this.#ws = wsConnect(wsUrl, { timeoutMs });
       const timer = setTimeout(() => {
         try { this.#ws.close(); } catch {}
         rej(new Error('CDP connect timeout'));
@@ -828,6 +946,51 @@ function parseWaitArgs(args) {
     throw new Error('wait: selector required (or use --load / --network-idle)');
   }
   return { selector, timeout, visible, load, networkIdle, idleMs };
+}
+
+// BH helpers.py press_key alignment: key → {vk, code, text}
+// Modifiers bitfield: 1=Alt, 2=Ctrl, 4=Meta(Cmd), 8=Shift.
+const PRESS_KEYS = {
+  Enter: { vk: 13, code: 'Enter', text: '\r' },
+  Tab: { vk: 9, code: 'Tab', text: '\t' },
+  Backspace: { vk: 8, code: 'Backspace', text: '' },
+  Escape: { vk: 27, code: 'Escape', text: '' },
+  Delete: { vk: 46, code: 'Delete', text: '' },
+  ' ': { vk: 32, code: 'Space', text: ' ' },
+  ArrowLeft: { vk: 37, code: 'ArrowLeft', text: '' },
+  ArrowUp: { vk: 38, code: 'ArrowUp', text: '' },
+  ArrowRight: { vk: 39, code: 'ArrowRight', text: '' },
+  ArrowDown: { vk: 40, code: 'ArrowDown', text: '' },
+  Home: { vk: 36, code: 'Home', text: '' },
+  End: { vk: 35, code: 'End', text: '' },
+  PageUp: { vk: 33, code: 'PageUp', text: '' },
+  PageDown: { vk: 34, code: 'PageDown', text: '' },
+};
+
+async function pressStr(cdp, sid, args) {
+  const key = args[0];
+  if (!key) throw new Error('press: key required (e.g. Enter, Tab, "a", " ")');
+  const modFlags = { ctrl: 2, shift: 8, alt: 1, meta: 4 };
+  let modifiers = 0;
+  for (const [flag, bit] of Object.entries(modFlags)) {
+    if (args.includes(`--${flag}`)) modifiers |= bit;
+  }
+  const spec = PRESS_KEYS[key] ?? (key.length === 1 ? { vk: key.charCodeAt(0), code: key, text: key } : null); // BH uses ord(key[0])
+  if (!spec) throw new Error(`press: unsupported key "${key}" (single char or one of: ${Object.keys(PRESS_KEYS).join(', ')})`);
+
+  const base = { key, code: spec.code, modifiers, windowsVirtualKeyCode: spec.vk, nativeVirtualKeyCode: spec.vk };
+  const shortcutMods = modifiers & (1 | 2 | 4); // Alt/Ctrl/Meta turn single keys into shortcuts
+  const printable = key.length === 1 && !!spec.text && !shortcutMods;
+  await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', ...base, ...(printable || !spec.text ? {} : { text: spec.text }) }, sid);
+  if (printable) {
+    // NB: text lives on spec, not base — destructuring it from base yields
+    // undefined, and JSON.stringify drops undefined fields, so Chrome gets a
+    // text-less char event (accepted, but inserts nothing).
+    const { text, ...baseNoText } = { text: spec.text, ...base };
+    await cdp.send('Input.dispatchKeyEvent', { type: 'char', text, ...baseNoText }, sid);
+  }
+  await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', ...base }, sid);
+  return JSON.stringify({ key, modifiers });
 }
 
 async function waitStr(cdp, sid, args) {
@@ -1398,16 +1561,33 @@ async function runBrowserDaemon() {
   // with fresh connections piles up popups (each attempt re-prompts), so we
   // never reconnect inside a daemon lifetime. The CLI waits ~30s for the
   // socket; click Allow within that window and the daemon comes up.
-  try {
-    await cdp.connect(getWsUrl(), 20000);
-    log('daemon', 'connected to Chrome');
-    await closeInspectTabs(cdp);
-  } catch (e) {
-    releaseDaemonPidLock();
-    log('daemon', 'connect FAILED (single attempt):', e.message);
-    process.stderr.write('Browser daemon: cannot connect to Chrome\n');
-    process.exit(1);
+  let chromeConnected = false;
+  let connectRetryTimer = null;
+  async function connectOnce() {
+    try {
+      await cdp.connect(getWsUrl(), 8000);
+      chromeConnected = true;
+      log('daemon', 'connected to Chrome');
+      await closeInspectTabs(cdp);
+      await cdp.send('Target.setAutoAttach', {
+        autoAttach: true,
+        waitForDebuggerOnStart: false,
+        flatten: true,
+        filter: [{ type: 'page', exclude: true }, {}],
+      });
+      if (connectRetryTimer) { clearInterval(connectRetryTimer); connectRetryTimer = null; }
+      return true;
+    } catch (e) {
+      log('daemon', 'connect attempt failed (retrying):', e.message);
+      return false;
+    }
   }
+  // Keep trying in the background so Chrome's Allow prompt stays up (one modal
+  // at a time); the user can click it whenever they see it, no race with a
+  // single command window.
+  connectOnce().then((ok) => {
+    if (!ok) connectRetryTimer = setInterval(() => { if (!chromeConnected) connectOnce(); }, 10000);
+  });
 
   // sessions: targetId → sessionId
   // Populated via Target.attachedToTarget events (from setAutoAttach) + fallback attachToTarget
@@ -1570,8 +1750,10 @@ async function runBrowserDaemon() {
     process.exit(0);
   }
 
-  // Exit if Chrome disconnects
-  cdp.onClose(() => shutdown());
+  // Exit if Chrome disconnects (but not when a connect attempt merely failed —
+  // e.g. the Allow prompt wasn't answered in time; the daemon stays up and
+  // retries on the next command).
+  cdp.onClose(() => { if (chromeConnected) shutdown(); });
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
 
@@ -1645,15 +1827,7 @@ async function runBrowserDaemon() {
     }
   });
 
-  // Level 1: browser-level setAutoAttach, excluding page targets.
-  // Attach only to 'tab' targets (Chrome's tab wrapper) — same as Puppeteer.
-  // Direct browser→page attachment is what triggers the popup; this avoids it.
-  await cdp.send('Target.setAutoAttach', {
-    autoAttach: true,
-    waitForDebuggerOnStart: false,
-    flatten: true,
-    filter: [{ type: 'page', exclude: true }, {}],
-  });
+  // (Level 1 setAutoAttach is issued inside connectOnce above.)
 
   // Get or wait for a session for a given targetId.
   async function getSession(targetId) {
@@ -1673,8 +1847,26 @@ async function runBrowserDaemon() {
     });
   }
 
+  // The daemon keeps trying to connect in the background (connectOnce +
+  // interval above), so Chrome's Allow prompt stays up. A command just waits
+  // for the connection to land — clicking Allow while any command is running
+  // lets that same command complete.
+  async function ensureChrome() {
+    if (chromeConnected) return;
+    log('daemon', 'waiting for Chrome connection (click "Allow debugging" in Chrome)');
+    const deadline = Date.now() + 60000;
+    while (!chromeConnected && Date.now() < deadline) await sleep(500);
+    if (!chromeConnected) throw new Error('Chrome connection pending — click "Allow debugging" in Chrome, then run this command again');
+    sessions.clear();
+    if (cdp.networkTrackers) cdp.networkTrackers.clear();
+  }
+
   // Handle a command; targetId is required for tab-specific commands
   async function runCommand({ cmd, targetId, args }) {
+    if (cmd !== 'stats' && cmd !== 'stop') {
+      try { await ensureChrome(); }
+      catch (e) { return { ok: false, error: e.message }; }
+    }
     const trace = {
       pageCacheStatus: '',
       pageListMs: 0,
@@ -1834,6 +2026,9 @@ async function runBrowserDaemon() {
                 break;
               case 'wait':
                 commandResult = await waitStr(cdp, sessionId, args);
+                break;
+              case 'press':
+                commandResult = await pressStr(cdp, sessionId, args);
                 break;
               default: throw new Error(`Unknown command: ${cmd}`);
             }
@@ -2189,6 +2384,9 @@ Usage: cdp <command> [args]
                                     Wait for document.readyState == 'complete' (SPA-safe page load)
   wait  <target> --network-idle [--timeout <ms>] [--idle <ms>]
                                     Wait until no in-flight requests and quiet for idle ms (default 500)
+  press <target> <key> [--ctrl|--shift|--alt|--meta]
+                                    Dispatch a key press (Enter/Tab/Arrows/char...)
+                                    with optional modifier combo
   evalraw <target> <method> [json]  Send a raw CDP command; returns JSON result
                                     e.g. evalraw <t> "DOM.getDocument" '{}'
   open  [url]                       Open url in a blank tab if one exists (reused), else a new tab (default: about:blank)
@@ -2228,7 +2426,7 @@ DAEMON IPC (for advanced use / scripting)
 
 const NEEDS_TARGET = new Set([
   'inspect','snap','snapshot','eval','shot','screenshot','html','nav','navigate',
-  'net','network','click','clickxy','type','loadall','evalraw','wait',
+  'net','network','click','clickxy','type','loadall','evalraw','wait','press',
 ]);
 
 async function main() {

@@ -1,0 +1,16 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>press-test</title></head>
+<body>
+<form id="f" onsubmit="document.title='submitted'; return false">
+  <input id="a" autofocus>
+  <input id="b">
+  <button type="submit" style="display:none">go</button>
+</form>
+<script>
+  window.__keys = [];
+  document.addEventListener('keydown', function (e) {
+    var m = (e.ctrlKey ? '+ctrl' : '') + (e.shiftKey ? '+shift' : '') + (e.metaKey ? '+meta' : '') + (e.altKey ? '+alt' : '');
+    window.__keys.push(e.key + m);
+  });
+</script>
+</body></html>
