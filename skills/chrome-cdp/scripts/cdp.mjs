@@ -996,6 +996,86 @@ async function pressStr(cdp, sid, args) {
   return JSON.stringify({ key, modifiers });
 }
 
+async function jsEvalRaw(cdp, sid, expression) {
+  await cdp.send('Runtime.enable', {}, sid);
+  const result = await cdp.send('Runtime.evaluate', {
+    expression, returnByValue: true, awaitPromise: true,
+  }, sid);
+  if (result.exceptionDetails) {
+    throw new Error(result.exceptionDetails.text || result.exceptionDetails.exception?.description);
+  }
+  return result.result.value;
+}
+
+// BH helpers.py fill_input alignment: focus -> clear (select-all + Backspace) ->
+// per-char real key events -> synthetic input+change so frameworks (React
+// controlled, Vue v-model) see the update. Input.insertText (type) bypasses
+// framework listeners; real key events plus the synthetic pair do not.
+async function fillStr(cdp, sid, args) {
+  const selector = args[0];
+  if (!selector) throw new Error('fill: selector required (e.g. #email)');
+  let clearFirst = true;
+  let timeout = 0;
+  const textTokens = [];
+  for (let i = 1; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--no-clear') clearFirst = false;
+    else if (a === '--timeout') timeout = parsePositiveInteger(args[++i], 'timeout');
+    else textTokens.push(a);
+  }
+  const text = textTokens.join(' ');
+  if (!text) throw new Error('fill: text required');
+  if (timeout > 0) {
+    await waitStr(cdp, sid, [selector, '--timeout', String(timeout)]);
+  }
+  const focused = await jsEvalRaw(cdp, sid, `(()=>{const e=document.querySelector(${JSON.stringify(selector)});if(!e)return false;e.focus();return true})()`);
+  if (!focused) throw new Error(`fill: element not found: ${selector}`);
+  if (clearFirst) {
+    // JS select() + Backspace. BH dispatches Cmd/Ctrl+A via rawKeyDown, but
+    // CDP-synthesized shortcut keys never fire Chrome's select-all edit
+    // command (measured: selection stays put even in a foreground tab, and
+    // background tabs — our e2e default — never receive edit commands at all).
+    // select() is deterministic in both; the Backspace below is still a real
+    // key event, so key listeners still fire.
+    await jsEvalRaw(cdp, sid, `(()=>{const e=document.querySelector(${JSON.stringify(selector)});if(!e)return false;e.select();return true})()`);
+    await pressStr(cdp, sid, ['Backspace']);
+  }
+  for (const ch of text) {
+    await pressStr(cdp, sid, [ch]);
+  }
+  await jsEvalRaw(cdp, sid, `(()=>{const e=document.querySelector(${JSON.stringify(selector)});if(!e)return;e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));})()`);
+  return JSON.stringify({ chars: text.length, cleared: clearFirst });
+}
+
+// BH helpers.py scroll alignment: mouse wheel at viewport CSS-pixel coords.
+async function scrollStr(cdp, sid, args) {
+  const x = parseInteger(args[0], 'x');
+  const y = parseInteger(args[1], 'y');
+  let dy = -300;
+  let dx = 0;
+  for (let i = 2; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--dy') dy = parseInteger(args[++i], 'dy');
+    else if (a === '--dx') dx = parseInteger(args[++i], 'dx');
+    else throw new Error(`Unknown scroll option: ${a}`);
+  }
+  await cdp.send('Input.dispatchMouseEvent', { type: 'mouseWheel', x, y, deltaX: dx, deltaY: dy }, sid);
+  return JSON.stringify({ x, y, deltaX: dx, deltaY: dy });
+}
+
+// BH helpers.py upload_file alignment: set files on a file input via CDP.
+async function uploadStr(cdp, sid, args) {
+  const selector = args[0];
+  const path = args[1];
+  if (!selector) throw new Error('upload: selector required (file input)');
+  if (!path) throw new Error('upload: file path required');
+  const doc = await cdp.send('DOM.getDocument', { depth: -1 }, sid);
+  const q = await cdp.send('DOM.querySelector', { nodeId: doc.root.nodeId, selector }, sid);
+  if (!q.nodeId) throw new Error(`upload: no element for selector ${selector}`);
+  await cdp.send('DOM.setFileInputFiles', { files: [path], nodeId: q.nodeId }, sid);
+  return JSON.stringify({ files: [path] });
+}
+
 async function waitStr(cdp, sid, args) {
   const { selector, timeout, visible, load, networkIdle, idleMs } = parseWaitArgs(args);
   const startedAt = Date.now();
@@ -2063,6 +2143,32 @@ async function runBrowserDaemon() {
               case 'switch':
                 await cdp.send('Target.activateTarget', { targetId });
                 return JSON.stringify({ targetId, activated: true });
+              case 'fill':
+                commandResult = await fillStr(cdp, sessionId, args);
+                break;
+              case 'scroll':
+                commandResult = await scrollStr(cdp, sessionId, args);
+                break;
+              case 'upload':
+                commandResult = await uploadStr(cdp, sessionId, args);
+                break;
+              case 'ensure-real-tab': {
+                // BH ensure_real_tab: if the tab is an internal page (chrome://,
+                // about:, devtools://, chrome-extension://), switch to the first
+                // real (non-internal) tab; otherwise leave it alone.
+                const INTERNAL = ['chrome://', 'chrome-untrusted://', 'devtools://', 'chrome-extension://', 'about:'];
+                const isInternal = (u) => INTERNAL.some((pre) => u.startsWith(pre));
+                const pages = await getPages(cdp, { includeInternal: true });
+                const cur = pages.find((t) => t.targetId === targetId);
+                if (!cur) throw new Error(`ensure-real-tab: unknown target ${targetId}`);
+                if (!isInternal(cur.url)) {
+                  return JSON.stringify({ switched: false, targetId, url: cur.url, title: cur.title });
+                }
+                const real = pages.filter((t) => !isInternal(t.url));
+                if (!real.length) throw new Error('ensure-real-tab: no real (non-internal) tab open');
+                await cdp.send('Target.activateTarget', { targetId: real[0].targetId });
+                return JSON.stringify({ switched: true, targetId: real[0].targetId, url: real[0].url, title: real[0].title });
+              }
               default: throw new Error(`Unknown command: ${cmd}`);
             }
             trace.commandMs = Date.now() - commandStarted;
@@ -2423,6 +2529,16 @@ Usage: cdp <command> [args]
                                     with optional modifier combo
   close <target>                    Close the tab
   switch <target>                   Activate the tab (bring to foreground)
+  fill <target> <selector> <text...> [--no-clear] [--timeout <ms>]
+                                    Fill a framework-managed input: focus, clear,
+                                    type real key events, then fire input+change
+                                    (works where insertText-based type does not)
+  scroll <target> <x> <y> [--dy <px>] [--dx <px>]
+                                    Wheel-scroll at viewport coords (default dy=-300)
+  upload <target> <selector> <path>
+                                    Set files on a file input (DOM.setFileInputFiles)
+  ensure-real-tab <target>          If the tab is an internal page (chrome:// etc.),
+                                    switch to the first real tab; else no-op
   evalraw <target> <method> [json]  Send a raw CDP command; returns JSON result
                                     e.g. evalraw <t> "DOM.getDocument" '{}'
   open  [url]                       Open url in a blank tab if one exists (reused), else a new tab (default: about:blank)
@@ -2456,13 +2572,15 @@ DAEMON IPC (for advanced use / scripting)
     Response: {"id":<number>, "ok":true,  "result":"<string>"}
            or {"id":<number>, "ok":false, "error":"<message>"}
   Commands mirror the CLI: stats, inspect, snap, eval, shot, html, nav, net,
-  click, clickxy, type, loadall, wait, evalraw, stop. Use evalraw to send arbitrary CDP methods.
+  click, clickxy, type, loadall, wait, press, close, switch, fill, scroll,
+  upload, ensure-real-tab, evalraw, stop. Use evalraw to send arbitrary CDP methods.
   The socket disappears when Chrome disconnects or after "cdp stop".
 `;
 
 const NEEDS_TARGET = new Set([
   'inspect','snap','snapshot','eval','shot','screenshot','html','nav','navigate',
   'net','network','click','clickxy','type','loadall','evalraw','wait','press','close','switch',
+  'fill','scroll','upload','ensure-real-tab',
 ]);
 
 async function main() {

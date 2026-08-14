@@ -1,0 +1,27 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>batch2-test</title>
+<style>
+  #scroller { position: fixed; inset: 0; overflow: auto; }
+  #spacer { height: 4000px; }
+</style>
+</head><body>
+<form id="f">
+  <input id="fill" value="OLDVALUE">
+  <input type="file" id="file">
+</form>
+<div id="late"></div>
+<div id="scroller"><div id="spacer"></div></div>
+<script>
+  window.__events = [];
+  var fill = document.getElementById('fill');
+  fill.addEventListener('input', function () { window.__events.push('input'); });
+  fill.addEventListener('change', function () { window.__events.push('change'); });
+  window.__keylog = [];
+  fill.addEventListener('keydown', function (e) { window.__keylog.push(e.key); });
+  setTimeout(function () {
+    var d = document.getElementById('late');
+    d.innerHTML = '<input id="late-input">';
+    window.__lateRendered = true;
+  }, 1500);
+</script>
+</body></html>
