@@ -828,6 +828,16 @@ async function getPages(cdp, { includeInternal = false } = {}) {
   return targetInfos.filter(t => t.type === 'page' && (includeInternal || !t.url.startsWith('chrome://')));
 }
 
+// Cross-origin (OOPIF) iframes are independent CDP targets (type=iframe).
+// Fresh enumeration every call — iframes appear/disappear dynamically and
+// must never come from the TTL page cache.
+async function getIframes(cdp) {
+  const { targetInfos } = await cdp.send('Target.getTargets');
+  return targetInfos
+    .filter(t => t.type === 'iframe')
+    .map(t => ({ targetId: t.targetId, url: t.url || '', title: t.title || '' }));
+}
+
 function formatPageList(pages, currentTargetId) {
   const prefixLen = getDisplayPrefixLength(pages.map(p => p.targetId));
   return pages.map(p => {
@@ -1766,7 +1776,16 @@ async function runBrowserDaemon() {
       if (!/No target matching prefix/.test(message)) throw error;
       pageSnapshot = await getPagesCached(true);
       pages = pageSnapshot.pages;
-      targetId = resolvePrefix(prefix, pages.map(p => p.targetId), 'target', 'Run "cdp list".');
+      try {
+        targetId = resolvePrefix(prefix, pages.map(p => p.targetId), 'target', 'Run "cdp list".');
+      } catch (error2) {
+        const message2 = String(error2?.message || '');
+        if (!/No target matching prefix/.test(message2)) throw error2;
+        // Fallback: cross-origin iframes are CDP targets too (BH
+        // iframe_target). Resolve against a fresh iframe enumeration.
+        const iframes = await getIframes(cdp);
+        targetId = resolvePrefix(prefix, iframes.map(f => f.targetId), 'target', 'Run "cdp iframe".');
+      }
     }
     rememberResolvedTarget(prefix, targetId);
     return {
@@ -1931,7 +1950,9 @@ async function runBrowserDaemon() {
       sessions,
       isKnownTarget: async (tid) => {
         const { pages } = await getPagesCached();
-        return pages.some((p) => p.targetId === tid);
+        if (pages.some((p) => p.targetId === tid)) return true;
+        const iframes = await getIframes(cdp);
+        return iframes.some((f) => f.targetId === tid);
       },
       attach: async (tid) => {
         const res = await cdp.send('Target.attachToTarget', { targetId: tid, flatten: true });
@@ -2003,6 +2024,25 @@ async function runCommand({ cmd, targetId, args, session }) {
           trace.pageListMs = Date.now() - pageListStarted;
           trace.pageCacheStatus = cacheStatus;
           result = JSON.stringify(pages);
+          break;
+        }
+        case 'iframe': {
+          // BH iframe_target: list all OOPIF iframes, or resolve the first
+          // whose URL contains the given substring. The returned targetId
+          // works with every page command (eval/click/inspect/...).
+          const iframes = await getIframes(cdp);
+          const sub = args[0];
+          if (!sub) {
+            result = JSON.stringify({
+              list: iframes.map(f => `${f.targetId.slice(0, 8)}  ${(f.title || '').substring(0, 40)}  ${f.url}`),
+            });
+          } else {
+            const m = iframes.find(f => f.url.includes(sub));
+            if (!m) {
+              return { ok: false, error: `no iframe matching "${sub}" (${iframes.length} iframe(s) found)`, trace };
+            }
+            result = JSON.stringify({ targetId: m.targetId, url: m.url, title: m.title });
+          }
           break;
         }
         case 'current': {
@@ -2554,6 +2594,9 @@ Usage: cdp <command> [args]
 
   list [--session <id>]             List open pages; * marks this session's current tab
   current [--session <id>]          Show this session's current tab (BH current_tab)
+  iframe [url-substr]               List cross-origin iframe targets, or resolve the first
+                                    whose URL contains the substring; the id works with
+                                    every page command (eval/click/inspect/...)
   stats                             Show browser daemon health and recent command timings
   inspect <target> [selector] [--limit <n>] [--sections a,b,c] [--text-max <n>] [--no-text]
                                     Lightweight page summary with optional section/output scoping
@@ -2638,7 +2681,7 @@ DAEMON IPC (for advanced use / scripting)
            or {"id":<number>, "ok":false, "error":"<message>"}
   Commands mirror the CLI: stats, inspect, snap, eval, shot, html, nav, net,
   click, clickxy, type, loadall, wait, press, close, switch, fill, scroll,
-  upload, ensure-real-tab, current, evalraw, stop. Use evalraw to send arbitrary CDP methods.
+  upload, ensure-real-tab, current, iframe, evalraw, stop. Use evalraw to send arbitrary CDP methods.
   The socket disappears when Chrome disconnects or after "cdp stop".
 `;
 
@@ -2693,6 +2736,21 @@ async function main() {
     const response = await sendCommand(conn, { cmd: 'stats', args: [] });
     if (!response.ok) { console.error('Error:', response.error); process.exit(1); }
     console.log(response.result);
+    return;
+  }
+
+  // Cross-origin iframes (BH iframe_target): list all, or resolve the first
+  // whose URL contains the substring; the id works with every page command.
+  if (cmd === 'iframe') {
+    const conn = await getOrStartBrowserDaemon();
+    const response = await sendCommand(conn, { cmd: 'iframe', args, session });
+    if (!response.ok) { console.error('Error:', response.error); process.exit(1); }
+    const data = JSON.parse(response.result);
+    if (data.list) {
+      console.log(data.list.join('\n'));
+    } else {
+      console.log(`iframe: ${data.targetId.slice(0, 8)}  ${data.title}  ${data.url}`);
+    }
     return;
   }
 
