@@ -23,6 +23,9 @@ const DAEMON_CONNECT_RETRIES = 100;
 const DAEMON_CONNECT_DELAY = 300;
 const MIN_TARGET_PREFIX_LEN = 8;
 const COMMAND_HISTORY_LIMIT = 50;
+const AUDIT_MAX_BYTES = 5 * 1024 * 1024;
+const AUDIT_DIR = process.env.CDP_AUDIT_DIR || resolve(homedir(), '.cdp');
+const AUDIT_FILE = process.env.CDP_AUDIT_FILE || resolve(AUDIT_DIR, 'audit.jsonl');
 const HTML_OUTPUT_LIMIT = 20000;
 const NET_ENTRY_LIMIT = 40;
 const METADATA_CACHE_TTL_MS = 1500;
@@ -1804,6 +1807,14 @@ async function runBrowserDaemon() {
     if (commandHistory.length > COMMAND_HISTORY_LIMIT) commandHistory.shift();
   }
 
+  function auditEntryCount() {
+    try {
+      const st = statSync(AUDIT_FILE);
+      if (!st || st.size === 0) return 0;
+      return readFileSync(AUDIT_FILE).toString().split('\n').filter(Boolean).length;
+    } catch { return 0; }
+  }
+
   async function statsStr() {
     const pageSnapshot = await getPagesCached().catch(() => ({ pages: [], cacheStatus: 'error', cacheAgeMs: 0 }));
     const pages = pageSnapshot.pages;
@@ -1816,6 +1827,7 @@ async function runBrowserDaemon() {
       `Browser daemon PID: ${process.pid}`,
       `Uptime: ${formatUptime(Date.now() - startedAt)}`,
       `Runtime dir: ${RUNTIME_DIR}`,
+      `Audit log: ${AUDIT_FILE} (${auditEntryCount()} entries)`, 
       `Socket: ${BROWSER_SOCK}`,
       `Sessions: ${sessions.size}`,
       `Pages: ${pages.length}`,
@@ -2444,6 +2456,22 @@ async function runCommand({ cmd, targetId, args, session }) {
     }
   }
 
+  // Persistent audit log: one JSON line per command (privacy-scrubbed —
+  // argument VALUES are never recorded, only count + total length). Never
+  // throws: audit must not affect command execution.
+  function appendAudit(entry) {
+    try {
+      mkdirSync(AUDIT_DIR, { recursive: true, mode: 0o700 });
+      let st = null;
+      try { st = statSync(AUDIT_FILE); } catch {}
+      if (st && st.size > AUDIT_MAX_BYTES) {
+        const data = readFileSync(AUDIT_FILE);
+        writeFileSync(AUDIT_FILE, data.slice(data.length >> 1));
+      }
+      appendFileSync(AUDIT_FILE, JSON.stringify(entry) + '\n');
+    } catch {}
+  }
+
   async function handleCommand(req) {
     const started = Date.now();
     const res = await runCommand(req);
@@ -2462,6 +2490,20 @@ async function runCommand({ cmd, targetId, args, session }) {
         commandMs: res.trace?.commandMs ?? 0,
         ok: !!res.ok,
         error: res.ok ? '' : String(res.error || '').slice(0, 120),
+      });
+    }
+    if (req.cmd !== 'list_raw') {
+      const args = Array.isArray(req.args) ? req.args : [];
+      appendAudit({
+        ts: new Date().toISOString(),
+        cmd: req.cmd,
+        args: args.length,
+        argChars: args.join(' ').length,
+        target: String(req.targetId || ''),
+        session: String(req.session || 'default'),
+        ok: !!res.ok,
+        error: res.ok ? '' : String(res.error || '').slice(0, 200),
+        ms: Date.now() - started,
       });
     }
     return res;

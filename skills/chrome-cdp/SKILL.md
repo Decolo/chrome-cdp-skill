@@ -55,7 +55,7 @@ Use `inspect` first for page state: title, URL, ready state, focus, visible cont
 scripts/cdp.mjs stats
 ```
 
-Shows browser daemon uptime, session/page counts, and recent command timings. Use this when local Chrome automation feels slow or resource-heavy.
+Shows browser daemon uptime, session/page counts, recent command timings, and the audit log location/entry count. Use this when local Chrome automation feels slow or resource-heavy.
 
 `stats` also shows short-TTL metadata cache behavior and separates recent command cost into setup, attach, page-enumeration, and command-body timing where relevant.
 
@@ -126,6 +126,7 @@ CSS px = screenshot image px / DPR
 - `fill` follows browser-harness `fill_input`: focus → clear (JS `select()` + Backspace) → per-char real key events → synthetic `input`+`change` events. Use it where `type` (Input.insertText) is ignored — React controlled inputs, Vue v-model, Ember tracked fields: insertText bypasses framework listeners, so submit buttons stay disabled. Note BH's select-all-via-Cmd/Ctrl+A shortcut does not work through CDP at all (synthetic key events never trigger Chrome's select-all edit command, and background tabs receive no edit commands); `select()` is deterministic in both.
 - `wait --network-idle` is the SPA-safe counterpart of `--load`: readyState becomes `complete` before framework XHR/fetch settle. It tracks in-flight requests per tab (Network domain enabled at attach, events never replayed — attach happens before navigation, so tracking is complete from navigation start). Long-lived connections (SSE/keepalive/streaming) keep the page busy forever — the wait then times out with `inflight: n`; this matches browser-harness semantics.
 - Browser-mechanic recipes (dialogs, cookies, downloads, drag-and-drop, dropdowns, iframes, shadow DOM, scrolling, tabs, uploads, viewport, PDF, screenshots, network): see `docs/interaction-skills/` — adapted from browser-harness's interaction-skills to this CLI.
+- Every command is appended to an audit log (`~/.cdp/audit.jsonl`, override with `CDP_AUDIT_FILE`): one JSON line with ts/cmd/args-count/arg-lengths/target/session/ok/error/ms. Argument VALUES are scrubbed (eval JS, cookie values, paths never logged). Analyze with `node scripts/audit.mjs` (summary / --errors / --since / --session / --raw); >5MB the log keeps only its tail.
 - Chrome shows an "Allow debugging" modal once per Chrome session. A background browser daemon keeps the CDP connection alive so subsequent commands need no further approval until Chrome disconnects or you run `stop`. Each daemon start makes exactly ONE connection attempt (20s window) — one popup, click it, done; cdp never reconnects inside a daemon lifetime, so popups can't pile up.
 - If Chrome is not running at all, `cdp` launches it automatically with the
   last-used profile — no manual start needed. Chrome 136+ ignores
