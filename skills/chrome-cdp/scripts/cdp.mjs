@@ -408,7 +408,7 @@ function getWsUrl() {
 }
 
 // Minimal RFC 6455 WebSocket client (zero-dep). Node's built-in WebSocket
-// cannot set request headers, and Chrome 144+ shows the "Allow debugging"
+// cannot set request headers, and Chrome 151 shows the "Allow debugging"
 // prompt for EVERY anonymous-origin connection. A fixed Origin header makes
 // the Allow grant sticky per origin, so the prompt fires once per Chrome
 // session instead of once per daemon restart.
@@ -826,9 +826,14 @@ class CDP {
 // Command implementations — return strings, take (cdp, sessionId)
 // ---------------------------------------------------------------------------
 
+// One definition of "internal page" for getPages filtering and
+// ensure-real-tab (they must agree on what is a real tab).
+const INTERNAL_URL_PREFIXES = ['chrome://', 'chrome-untrusted://', 'devtools://', 'chrome-extension://', 'about:'];
+const isInternalUrl = (u) => INTERNAL_URL_PREFIXES.some((pre) => u.startsWith(pre));
+
 async function getPages(cdp, { includeInternal = false } = {}) {
   const { targetInfos } = await cdp.send('Target.getTargets');
-  return targetInfos.filter(t => t.type === 'page' && (includeInternal || !t.url.startsWith('chrome://')));
+  return targetInfos.filter(t => t.type === 'page' && (includeInternal || !isInternalUrl(t.url)));
 }
 
 // Cross-origin (OOPIF) iframes are independent CDP targets (type=iframe).
@@ -1098,7 +1103,11 @@ async function waitStr(cdp, sid, args) {
   if (networkIdle) {
     // Idempotent enable: covers sessions attached before the tracker existed.
     await cdp.send('Network.enable', {}, sid).catch(() => {});
-    const t = cdp.networkTrackers?.get(sid) ?? { inflight: new Set(), lastActivity: Date.now() };
+    // Never use a throwaway tracker: events update the map entry, so the
+    // fallback MUST be stored or requests that start during the wait are
+    // invisible (wait would report idle instantly / prematurely).
+    let t = cdp.networkTrackers?.get(sid);
+    if (!t) { t = { inflight: new Set(), lastActivity: Date.now() }; cdp.networkTrackers.set(sid, t); }
     let found = false;
     let inflightCount = t.inflight.size;
     while (Date.now() < deadline) {
@@ -1652,7 +1661,7 @@ async function runBrowserDaemon() {
 
   const cdp = new CDP();
   log('daemon', 'starting, pid=', process.pid, 'socket=', sp);
-  // Chrome 144+ shows an "Allow debugging" popup per NEW WebSocket connection.
+  // Chrome 151 shows an "Allow debugging" popup per NEW WebSocket connection.
   // The daemon keeps one connection for its whole life; on failure it stays up
   // and retries with exponential backoff (connectOnce below), so the modal is
   // present for the user to click at any time instead of racing a command.
@@ -1933,35 +1942,44 @@ async function runBrowserDaemon() {
           filter: [{}],
         }, sessionId);
       } catch {}
-    } else if (targetInfo.type === 'page') {
-      // Level 2 fired: a page was attached from a tab session → store it
+    } else if (targetInfo.type === 'page' || targetInfo.type === 'iframe') {
+      // Level 2 fired: a page/iframe was attached from a tab session → store
+      // it so getSession resolves instantly (no second attach, no 500ms wait).
       sessions.set(targetInfo.targetId, sessionId);
       // Enable Network so idle tracking sees events from the start of any
       // navigation that follows (CDP never replays pre-enable events).
       cdp.send('Network.enable', {}, sessionId).catch(() => {});
+      // Page domain is required for Page.javascriptDialogOpening (dialog
+      // detection/blocking). Missing it silently breaks `cdp dialog` on tabs
+      // that were never `open`ed by us (user-opened tabs, window.open).
+      cdp.send('Page.enable', {}, sessionId).catch(() => {});
     }
   });
 
-  // Pending JS dialog (alert/confirm/prompt/beforeunload). Dialogs freeze
-  // the page's JS thread; Page.javascriptDialogOpening arrives on the page's
-  // session (needs Page.enable at attach — see getSession). Only the tab that
-  // opened the dialog is blocked, so we record its targetId.
-  let pendingDialog = null;
+  // Pending JS dialogs, keyed by targetId (a dialog freezes its page's JS
+  // thread; Page.javascriptDialogOpening arrives on the page's session and
+  // needs Page.enable at attach). Keyed so two tabs with dialogs don't
+  // overwrite each other; only the tab that opened the dialog is blocked.
+  const pendingDialogs = new Map(); // targetId -> dialog
   cdp.onEvent('Page.javascriptDialogOpening', (params, msg) => {
     let targetId = null;
     for (const [tid, sid] of sessions) {
       if (sid === msg.sessionId) { targetId = tid; break; }
     }
-    pendingDialog = {
+    pendingDialogs.set(targetId, {
       type: params.type,
       message: params.message,
       hasTouch: !!params.hasTouch,
       defaultPrompt: params.defaultPrompt,
       sessionId: msg.sessionId,
       targetId,
-    };
+    });
   });
-  cdp.onEvent('Page.javascriptDialogClosed', () => { pendingDialog = null; });
+  cdp.onEvent('Page.javascriptDialogClosed', (params, msg) => {
+    for (const [tid, d] of pendingDialogs) {
+      if (d.sessionId === msg?.sessionId) { pendingDialogs.delete(tid); break; }
+    }
+  });
 
   // Clean up sessions when targets go away
   cdp.onEvent('Target.targetDestroyed', (params) => {
@@ -2028,7 +2046,7 @@ const agentSessions = new Map();
 
 async function runCommand({ cmd, targetId, args, session }) {
     const sid = session || 'default';
-    if (cmd !== 'stats' && cmd !== 'stop') {
+    if (cmd !== 'stats' && cmd !== 'stop') {  // keep in sync with handleCommand's audit/record skip
       try { await ensureChrome(); }
       catch (e) { return { ok: false, error: e.message }; }
     }
@@ -2087,29 +2105,39 @@ async function runCommand({ cmd, targetId, args, session }) {
           if (action && action !== 'accept' && action !== 'dismiss') {
             return { ok: false, error: `unknown dialog action: "${action}" (accept|dismiss)`, trace };
           }
-          if (!pendingDialog) {
+          // Pick the dialog for this session's current tab first, else the
+          // most recently opened one (multi-tab dialogs are still possible;
+          // the picked tab is reported in the response).
+          let dialogEntry = null;
+          const cur = agentSessions.get(sid);
+          if (cur && pendingDialogs.has(cur)) dialogEntry = pendingDialogs.get(cur);
+          if (!dialogEntry) {
+            for (const d of pendingDialogs.values()) { dialogEntry = d; break; }
+          }
+          if (!dialogEntry) {
             result = JSON.stringify({ dialog: null });
             break;
           }
           if (!action) {
             result = JSON.stringify({
               dialog: {
-                type: pendingDialog.type,
-                message: pendingDialog.message,
-                hasTouch: pendingDialog.hasTouch,
-                defaultPrompt: pendingDialog.defaultPrompt,
+                type: dialogEntry.type,
+                message: dialogEntry.message,
+                hasTouch: dialogEntry.hasTouch,
+                defaultPrompt: dialogEntry.defaultPrompt,
               },
+              targetId: dialogEntry.targetId,
             });
             break;
           }
           const promptText = args.find((a, i) => i > 0 && args[i - 1] === '--prompt-text');
-          const dialog = { type: pendingDialog.type, message: pendingDialog.message };
+          const dialog = { type: dialogEntry.type, message: dialogEntry.message };
           await cdp.send('Page.handleJavaScriptDialog', {
             accept: action === 'accept',
             ...(action === 'accept' && promptText !== undefined ? { promptText } : {}),
-          }, pendingDialog.sessionId);
-          pendingDialog = null;
-          result = JSON.stringify({ handled: true, dialog, action });
+          }, dialogEntry.sessionId);
+          pendingDialogs.delete(dialogEntry.targetId);
+          result = JSON.stringify({ handled: true, dialog, action, targetId: dialogEntry.targetId });
           break;
         }
         case 'cookies': case 'cookie': {
@@ -2230,34 +2258,37 @@ async function runCommand({ cmd, targetId, args, session }) {
           // Full enumeration including chrome:// pages so a real new-tab page
           // (chrome://newtab) is reusable; bypasses the shared filter cache.
           const tabsBefore = await getPages(cdp, { includeInternal: true });
-                    const reusable = findReusableTab(tabsBefore);
+            const reusable = findReusableTab(tabsBefore);
           let targetId;
           if (reusable) {
             targetId = reusable.targetId;
             await cdp.send('Target.activateTarget', { targetId });
-                        const { sessionId } = await getSession(targetId);
-                        await cdp.send('Page.enable', {}, sessionId);
-                        // Page.navigate can take ~12s to respond on never-ending (streaming)
+                const { sessionId } = await getSession(targetId);
+                await cdp.send('Page.enable', {}, sessionId);
+                // Page.navigate can take ~12s to respond on never-ending (streaming)
             // pages; the navigation itself is async, so don't block open on it.
+            // open is fire-and-forget: success means the navigation was STARTED,
+            // not loaded — use `cdp wait <t> --load` / `cdp nav` when needed.
             const navP = cdp.send('Page.navigate', { url }, sessionId);
             await Promise.race([navP, sleep(2000)]);
             navP.catch(() => {});
-                      } else {
+              } else {
             // BH new_tab pattern: create blank, attach a session, THEN navigate.
             // createTarget({url}) navigates asynchronously — the tab stays on
             // about:blank for a while and Network/Runtime events for the early
-            // navigation are missed (CDP does not replay them).
+            // navigation are missed (CDP does not replay them). open is
+            // fire-and-forget; use `cdp wait <t> --load` / `cdp nav` for loaded.
             ({ targetId } = await cdp.send('Target.createTarget', { url: 'about:blank' }));
-                        // resolveSession's isKnownTarget check reads the TTL page cache —
+                // resolveSession's isKnownTarget check reads the TTL page cache —
             // a just-created target is not in it, so refresh before attaching
             // (otherwise it throws "No target with given id found").
             await getPagesCached(true);
-                        const { sessionId } = await getSession(targetId);
-                        await cdp.send('Page.enable', {}, sessionId);
-                        const navP = cdp.send('Page.navigate', { url }, sessionId);
+                const { sessionId } = await getSession(targetId);
+                await cdp.send('Page.enable', {}, sessionId);
+                const navP = cdp.send('Page.navigate', { url }, sessionId);
             await Promise.race([navP, sleep(2000)]);
             navP.catch(() => {});
-                      }
+              }
           // The opened tab becomes this session's current tab (BH new_tab
           // attaches and makes the tab current).
           agentSessions.set(sid, targetId);
@@ -2297,7 +2328,13 @@ async function runCommand({ cmd, targetId, args, session }) {
                 targetId = resolved.targetId;
                 args.shift();
               } catch (e) {
-                return { ok: false, error: e.message, trace };
+                // Escape hatch: a pure-hex ARGUMENT (e.g. `cdp eval deadbeef`,
+                // `cdp fill #x cafe01`) would otherwise be swallowed as a
+                // target prefix and fail resolution. If this session has a
+                // current tab, treat the hex token as a plain argument.
+                const curTab = agentSessions.get(sid);
+                if (curTab) targetId = curTab;
+                else return { ok: false, error: e.message, trace };
               }
             } else {
               const cur = agentSessions.get(sid);
@@ -2307,10 +2344,11 @@ async function runCommand({ cmd, targetId, args, session }) {
               targetId = cur;
             }
           }
-          if (pendingDialog && pendingDialog.targetId === targetId) {
+          const pendingDlg = pendingDialogs.get(targetId);
+          if (pendingDlg) {
             return {
               ok: false,
-              error: `page has a pending dialog (${pendingDialog.type}${pendingDialog.message ? `: ${pendingDialog.message.slice(0, 80)}` : ''}) — handle it with 'cdp dialog accept|dismiss' first`,
+              error: `page has a pending dialog (${pendingDlg.type}${pendingDlg.message ? `: ${pendingDlg.message.slice(0, 80)}` : ''}) — handle it with 'cdp dialog accept|dismiss' first`,
               trace,
             };
           }
@@ -2366,9 +2404,17 @@ async function runCommand({ cmd, targetId, args, session }) {
               case 'type':
                 commandResult = await typeStr(cdp, sessionId, args[0]);
                 break;
-              case 'loadall':
-                commandResult = await loadAllStr(cdp, sessionId, args[0], args[1] ? parseInt(args[1]) : 1500);
+              case 'loadall': {
+                let interval = 1500;
+                if (args[1] !== undefined) {
+                  interval = parseInt(args[1], 10);
+                  if (!Number.isInteger(interval) || interval < 0) {
+                    throw new Error(`invalid interval: "${args[1]}" (expected a non-negative integer ms)`);
+                  }
+                }
+                commandResult = await loadAllStr(cdp, sessionId, args[0], interval);
                 break;
+              }
               case 'evalraw':
                 commandResult = await evalRawStr(cdp, sessionId, args[0], args[1]);
                 break;
@@ -2414,15 +2460,13 @@ async function runCommand({ cmd, targetId, args, session }) {
                 // BH ensure_real_tab: if the tab is an internal page (chrome://,
                 // about:, devtools://, chrome-extension://), switch to the first
                 // real (non-internal) tab; otherwise leave it alone.
-                const INTERNAL = ['chrome://', 'chrome-untrusted://', 'devtools://', 'chrome-extension://', 'about:'];
-                const isInternal = (u) => INTERNAL.some((pre) => u.startsWith(pre));
                 const pages = await getPages(cdp, { includeInternal: true });
                 const cur = pages.find((t) => t.targetId === targetId);
                 if (!cur) throw new Error(`ensure-real-tab: unknown target ${targetId}`);
-                if (!isInternal(cur.url)) {
+                if (!isInternalUrl(cur.url)) {
                   return JSON.stringify({ switched: false, targetId, url: cur.url, title: cur.title });
                 }
-                const real = pages.filter((t) => !isInternal(t.url));
+                const real = pages.filter((t) => !isInternalUrl(t.url));
                 if (!real.length) throw new Error('ensure-real-tab: no real (non-internal) tab open');
                 await cdp.send('Target.activateTarget', { targetId: real[0].targetId });
                 return JSON.stringify({ switched: true, targetId: real[0].targetId, url: real[0].url, title: real[0].title });
@@ -2466,7 +2510,12 @@ async function runCommand({ cmd, targetId, args, session }) {
       try { st = statSync(AUDIT_FILE); } catch {}
       if (st && st.size > AUDIT_MAX_BYTES) {
         const data = readFileSync(AUDIT_FILE);
-        writeFileSync(AUDIT_FILE, data.slice(data.length >> 1));
+        // Keep the tail, but start at a line boundary so the file never
+        // begins with a half-written JSON entry.
+        let start = data.length >> 1;
+        const nl = data.indexOf(0x0a, start);
+        if (nl >= 0) start = nl + 1;
+        writeFileSync(AUDIT_FILE, data.slice(start));
       }
       appendFileSync(AUDIT_FILE, JSON.stringify(entry) + '\n');
     } catch {}
@@ -2537,6 +2586,8 @@ async function runCommand({ cmd, targetId, args, session }) {
           const payload = JSON.stringify({ ...res, id: req.id }) + '\n';
           if (res.stopAfter) conn.end(payload, shutdown);
           else conn.write(payload);
+        }).catch((e) => {
+          conn.write(JSON.stringify({ ok: false, error: String(e?.message || e), id: req.id }) + '\n');
         });
       }
     });
@@ -2755,12 +2806,30 @@ function wireConn(conn, st) {
   conn.on('close', () => failAll('Connection closed before response'));
 }
 
+const IPC_RESPONSE_TIMEOUT = 60000;
+// Shared CLI→daemon dispatch: connect (starting the daemon if needed), send
+// one command, print the result or exit(1) with the daemon's error message.
+async function cliSend(req) {
+  const conn = await getOrStartBrowserDaemon();
+  const response = await sendCommand(conn, req);
+  if (!response.ok) { console.error('Error:', response.error); process.exit(1); }
+  return response;
+}
+
 function sendCommand(conn, req, { close = true } = {}) {
   const st = connState(conn);
   wireConn(conn, st);
   const id = st.nextId++;
   return new Promise((resolve, reject) => {
-    st.pending.set(id, { id, resolve, reject, closeAfter: close });
+    const timer = setTimeout(() => {
+      st.pending.delete(id);
+      reject(new Error(`daemon did not respond within ${IPC_RESPONSE_TIMEOUT / 1000}s (cmd: ${req.cmd})`));
+    }, IPC_RESPONSE_TIMEOUT);
+    st.pending.set(id, {
+      id, resolve: (v) => { clearTimeout(timer); resolve(v); },
+      reject: (e) => { clearTimeout(timer); reject(e); },
+      closeAfter: close,
+    });
     conn.write(JSON.stringify({ ...req, id }) + '\n');
   });
 }
@@ -2928,17 +2997,13 @@ async function main() {
   }
 
   if (cmd === 'list' || cmd === 'ls') {
-    const conn = await getOrStartBrowserDaemon();
-    const response = await sendCommand(conn, { cmd: 'list', args: [], session });
-    if (!response.ok) { console.error('Error:', response.error); process.exit(1); }
+    const response = await cliSend({ cmd: 'list', args: [], session });
     console.log(response.result);
     return;
   }
 
   if (cmd === 'stats') {
-    const conn = await getOrStartBrowserDaemon();
-    const response = await sendCommand(conn, { cmd: 'stats', args: [] });
-    if (!response.ok) { console.error('Error:', response.error); process.exit(1); }
+    const response = await cliSend({ cmd: 'stats', args: [] });
     console.log(response.result);
     return;
   }
@@ -2946,9 +3011,7 @@ async function main() {
   // Cross-origin iframes (BH iframe_target): list all, or resolve the first
   // whose URL contains the substring; the id works with every page command.
   if (cmd === 'iframe') {
-    const conn = await getOrStartBrowserDaemon();
-    const response = await sendCommand(conn, { cmd: 'iframe', args, session });
-    if (!response.ok) { console.error('Error:', response.error); process.exit(1); }
+    const response = await cliSend({ cmd: 'iframe', args, session });
     const data = JSON.parse(response.result);
     if (data.list) {
       console.log(data.list.join('\n'));
@@ -2960,19 +3023,22 @@ async function main() {
 
   // L2 dialogs/cookies: no target needed (dialog state and cookies are
   // browser-level).
+  if (cmd === 'cookies') {
+    // M1: resolve relative snapshot paths against the caller's cwd (the
+    // daemon's cwd is wherever it was first spawned).
+    for (let i = 0; i < args.length - 1; i++) {
+      if ((args[i] === '--save' || args[i] === '--load') && args[i + 1]) args[i + 1] = resolve(args[i + 1]);
+    }
+  }
   if (cmd === 'dialog' || cmd === 'cookies' || cmd === 'cookie') {
-    const conn = await getOrStartBrowserDaemon();
-    const response = await sendCommand(conn, { cmd, args, session });
-    if (!response.ok) { console.error('Error:', response.error); process.exit(1); }
+    const response = await cliSend({ cmd, args, session });
     console.log(response.result);
     return;
   }
 
   // Current tab for this session (BH current_tab)
   if (cmd === 'current') {
-    const conn = await getOrStartBrowserDaemon();
-    const response = await sendCommand(conn, { cmd: 'current', args: [], session });
-    if (!response.ok) { console.error('Error:', response.error); process.exit(1); }
+    const response = await cliSend({ cmd: 'current', args: [], session });
     console.log(response.result); // JSON: {targetId, url, title, session}
     return;
   }
@@ -3022,14 +3088,23 @@ async function main() {
   // (daemon-side resolution) — e.g. `cdp eval "js"`, `cdp wait --load`,
   // `cdp wait "#x" --visible`, `cdp close --session A`.
   const a0 = args[0];
-  const explicitTarget = a0 && !a0.startsWith('-') && /^[0-9A-Fa-f]{6,}$/.test(a0);
+  let explicitTarget = a0 && !a0.startsWith('-') && /^[0-9A-Fa-f]{6,}$/.test(a0);
   if (cmd === 'switch' && !explicitTarget) {
     console.error('Error: switch requires a target — e.g. "cdp switch <target> [--session <id>]"');
     process.exit(1);
   }
 
+  // M1: resolve relative output paths on the CLI side. The daemon is a
+  // long-lived process whose cwd is wherever it was FIRST spawned; writing
+  // relative paths there would silently surprise later callers.
+  if (cmd === 'pdf' || cmd === 'shot') {
+    const fileIdx = explicitTarget ? 1 : 0;
+    const file = args[fileIdx];
+    if (file && !file.startsWith('-')) args[fileIdx] = resolve(file);
+  }
+
   const conn = await getOrStartBrowserDaemon();
-  const cmdArgs = explicitTarget ? args.slice(1) : args;
+  let cmdArgs = explicitTarget ? args.slice(1) : args;
 
   if (cmd === 'eval') {
     const expr = cmdArgs.join(' ');
@@ -3056,11 +3131,15 @@ async function main() {
     // One connection, two round trips: resolve the target prefix, then run the
     // command. The daemon's response for resolve_target carries the full id.
     const resolved = await sendCommand(conn, { cmd: 'resolve_target', args: [a0] }, { close: false });
-    if (!resolved.ok) {
-      console.error('Error:', resolved.error);
-      process.exit(1);
+    if (resolved.ok) {
+      targetId = JSON.parse(resolved.result).targetId;
+    } else {
+      // M4 escape hatch: the hex token may be a plain ARGUMENT (e.g. `cdp
+      // eval deadbeef`). Retry with the full args and no target; the daemon
+      // falls back to this session's current tab and errors only if none.
+      cmdArgs = args;
+      explicitTarget = false;
     }
-    targetId = JSON.parse(resolved.result).targetId;
   }
 
   const response = await sendCommand(conn, { cmd, targetId, args: cmdArgs, session });
@@ -3069,7 +3148,7 @@ async function main() {
     if (response.result) console.log(response.result);
   } else {
     console.error('Error:', response.error);
-    process.exitCode = 1;
+    process.exit(1);
   }
 }
 

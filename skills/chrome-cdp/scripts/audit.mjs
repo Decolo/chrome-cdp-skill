@@ -16,17 +16,24 @@ const file = process.env.CDP_AUDIT_FILE || resolve(homedir(), '.cdp', 'audit.jso
 let st;
 try { st = statSync(file); } catch { console.error(`no audit log at ${file}`); process.exit(1); }
 
-const sinceArg = (process.argv.find(a => a.startsWith('--since=')) || '').split('=')[1];
-const sessionArg = (process.argv.find(a => a.startsWith('--session=')) || '').split('=')[1];
+// Accept both `--since 24h` and `--since=24h` (same for --session).
+const argVal = (name) => {
+  const eq = process.argv.find(a => a.startsWith(`--${name}=`));
+  if (eq) return eq.split('=').slice(1).join('=');
+  const i = process.argv.indexOf(`--${name}`);
+  return i >= 0 && i + 1 < process.argv.length ? process.argv[i + 1] : undefined;
+};
+const sinceArg = argVal('since');
+const sessionArg = argVal('session');
 const errorsOnly = process.argv.includes('--errors');
 const raw = process.argv.includes('--raw');
 
 let since = 0;
 if (sinceArg) {
-  const n = Number(sinceArg.replace(/[a-z]/gi, ''));
-  const unit = sinceArg.replace(/[0-9]/g, '');
-  const mult = unit === 'h' ? 3600e3 : unit === 'd' ? 86400e3 : unit === 'm' ? 60e3 : 86400e3;
-  since = Date.now() - n * mult;
+  const m = /^(\d+)([hdms])$/.exec(sinceArg.trim());
+  if (!m) { console.error(`invalid --since: "${sinceArg}" (expected e.g. 24h, 7d, 30m, 45s)`); process.exit(1); }
+  const mult = { h: 3600e3, d: 86400e3, m: 60e3, s: 1e3 }[m[2]];
+  since = Date.now() - Number(m[1]) * mult;
 }
 
 const rows = readFileSync(file, 'utf8').split('\n').filter(Boolean).map(l => {
