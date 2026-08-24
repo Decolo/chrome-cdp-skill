@@ -50,6 +50,12 @@ const LOG_FILE = resolve(RUNTIME_DIR, 'cdp.log');
 // daemon can close it later — borrowed from browser-harness inspect_marker).
 const INSPECT_MARKER = resolve(RUNTIME_DIR, 'inspect-opened');
 const INSPECT_REOPEN_TTL_MS = 180_000;
+// macOS auto-approve of Chrome's per-connection "Allow remote debugging?"
+// sheet (browser-harness mac-approve alignment). See macApproveOnce below.
+const MAC_APPROVE_TIMEOUT_MS = 5000;
+const MAC_APPROVE_MAX_ATTEMPTS = 4;
+const MAC_APPROVE_ATTEMPT_GAP_MS = 700;
+const MAC_APPROVE_START_DELAY_MS = 2500;
 
 // Append-only log for the CLI and the daemon (both write to the same file,
 // tagged with the process role). Useful when a command silently fails or the
@@ -266,6 +272,169 @@ function openUrlViaAppleScript(url) {
     const r = spawnSync('osascript', ['-e', script], { timeout: 8000, stdio: 'ignore' });
     return r.status === 0;
   } catch { return false; }
+}
+
+// macOS: auto-approve Chrome's per-connection "Allow remote debugging?" sheet
+// (browser-harness `mac-approve` alignment — src/browser_harness/macos.py).
+// System Events walks Chrome's windows -> sheets and presses the Allow button
+// WITHOUT activating Chrome. Requires Accessibility permission for the app
+// that launched the terminal (iTerm, Terminal, ...) in System Settings >
+// Privacy & Security > Accessibility — a one-time grant; after that the CLI
+// approves the sheet automatically and the user never clicks Allow.
+// Opt out with CDP_NO_MAC_APPROVE=1.
+const MAC_APPROVE_SCRIPT = `using terms from application "System Events"
+	on clickAllow(nodeRef)
+		try
+			if (role of nodeRef as text) is "AXButton" and ¬
+				((description of nodeRef as text) is "Allow" or ¬
+				 (description of nodeRef as text) is "允许") then
+				perform action "AXPress" of nodeRef
+				return true
+			end if
+		end try
+		try
+			repeat with childRef in UI elements of nodeRef
+				if my clickAllow(childRef) then return true
+			end repeat
+		end try
+		return false
+	end clickAllow
+end using terms from
+
+set resultText to "not-found"
+set targetProcess to "__CDP_CHROME_PROCESS__"
+tell application "System Events"
+	if exists process targetProcess then
+		tell process targetProcess
+			-- exact pass: English and Chinese sheet titles (Chrome is
+			-- localized; browser-harness matches only the English title)
+			repeat with w in windows
+				try
+					repeat with s in sheets of w
+						if (name of s as text) is "Allow remote debugging?" or ¬
+							(name of s as text) is "要允许远程调试吗？" then
+							if my clickAllow(s) then
+								set resultText to "ready"
+								exit repeat
+							end if
+						end if
+					end repeat
+				end try
+				if resultText is "ready" then exit repeat
+			end repeat
+			if resultText is "not-found" then
+				-- lenient pass: Chrome may reword the sheet (151+)
+				repeat with w in windows
+					try
+						repeat with s in sheets of w
+							if (name of s as text) contains "remote debugging" or ¬
+								(name of s as text) contains "远程调试" then
+								if my clickAllow(s) then
+									set resultText to "ready"
+									exit repeat
+								end if
+							end if
+						end repeat
+					end try
+					if resultText is "ready" then exit repeat
+				end repeat
+			end if
+		end tell
+	end if
+end tell
+return resultText`;
+
+const MAC_APPROVE_ACCESSIBILITY_HINT =
+  'grant Accessibility to the app running the terminal (iTerm, Terminal, ...) ' +
+  'in System Settings > Privacy & Security > Accessibility, then rerun ' +
+  '(or run `cdp mac-approve` to check)';
+
+// System Events process names differ from `open -a` app names: Brave.app ->
+// "Brave Browser", Edge.app -> "Microsoft Edge". CDP_CHROME_APP (also used by
+// launchChrome / openInspectGuide) is mapped here too.
+function macApproveScript(app = process.env.CDP_CHROME_APP) {
+  const base = String(app || 'Google Chrome').split('/').pop().replace(/\.app$/, '');
+  const name = { Brave: 'Brave Browser', Edge: 'Microsoft Edge' }[base] || base;
+  const safe = name.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  return MAC_APPROVE_SCRIPT.replace('__CDP_CHROME_PROCESS__', safe);
+}
+
+// Pure classifier (unit-tested). Statuses mirror browser-harness mac-approve:
+// ready / setup-required / accessibility-required / not-found / error /
+// unsupported.
+function classifyMacApprove({ platform = process.platform, toggleEnabled, socketUp = false, exitCode = null, timedOut = false, stdout = '', stderr = '' } = {}) {
+  if (socketUp) return { status: 'ready', detail: null };
+  if (platform !== 'darwin') return { status: 'unsupported', detail: 'macOS only' };
+  if (toggleEnabled !== true) {
+    return {
+      status: 'setup-required',
+      detail: 'tick "Allow remote debugging" at chrome://inspect/#remote-debugging first',
+    };
+  }
+  const out = String(stdout || '').trim();
+  const err = String(stderr || '').trim();
+  if (timedOut) return { status: 'accessibility-required', detail: MAC_APPROVE_ACCESSIBILITY_HINT };
+  if (exitCode !== 0) {
+    if (/not authorized|assistive/i.test(err)) {
+      return { status: 'accessibility-required', detail: MAC_APPROVE_ACCESSIBILITY_HINT };
+    }
+    return { status: 'error', detail: err || `osascript exited ${exitCode}` };
+  }
+  if (out === 'ready') return { status: 'ready', detail: null };
+  if (out === 'not-found') return { status: 'not-found', detail: 'no "Allow remote debugging?" sheet visible' };
+  return { status: 'error', detail: `unexpected osascript output: ${out || '<empty>'}` };
+}
+
+// Run the AppleScript via stdin (like browser-harness). Never throws; returns
+// { exitCode, timedOut, stdout, stderr }.
+function runMacApproveScript() {
+  try {
+    const r = spawnSync('osascript', [], {
+      input: macApproveScript(),
+      timeout: MAC_APPROVE_TIMEOUT_MS,
+      encoding: 'utf8',
+    });
+    if (r.error) {
+      return {
+        exitCode: null,
+        timedOut: r.error.code === 'ETIMEDOUT',
+        stdout: '',
+        stderr: String(r.error.message || 'osascript failed'),
+      };
+    }
+    return { exitCode: r.status, timedOut: false, stdout: r.stdout || '', stderr: r.stderr || '' };
+  } catch (e) {
+    return { exitCode: null, timedOut: false, stdout: '', stderr: String((e && e.message) || e) };
+  }
+}
+
+// One approve attempt. socketUp short-circuits to ready (daemon already
+// connected — nothing to click).
+function macApproveOnce({ socketUp = false } = {}) {
+  if (socketUp) return { status: 'ready', detail: null };
+  const toggle = localStateUserEnabled();
+  if (process.platform !== 'darwin' || toggle !== true) {
+    return classifyMacApprove({ toggleEnabled: toggle, socketUp });
+  }
+  const r = runMacApproveScript();
+  return classifyMacApprove({
+    toggleEnabled: true,
+    exitCode: r.exitCode,
+    timedOut: r.timedOut,
+    stdout: r.stdout,
+    stderr: r.stderr,
+  });
+}
+
+// Bounded daemon-socket liveness probe (standalone `cdp mac-approve` uses it;
+// connectToSocket alone would hang forever when no daemon is running).
+function socketUp(timeoutMs = 1000) {
+  return new Promise((resolve) => {
+    const conn = net.connect(BROWSER_SOCK);
+    const t = setTimeout(() => { try { conn.destroy(); } catch {} resolve(false); }, timeoutMs);
+    conn.on('connect', () => { clearTimeout(t); try { conn.destroy(); } catch {} resolve(true); });
+    conn.on('error', () => { clearTimeout(t); resolve(false); });
+  });
 }
 
 // Open the remote-debugging permission page in the user's browser, at most
@@ -2046,7 +2215,7 @@ const agentSessions = new Map();
 
 async function runCommand({ cmd, targetId, args, session }) {
     const sid = session || 'default';
-    if (cmd !== 'stats' && cmd !== 'stop') {  // keep in sync with handleCommand's audit/record skip
+    if (cmd !== 'stats' && cmd !== 'stop' && cmd !== 'ping') {  // keep in sync with handleCommand's audit/record skip
       try { await ensureChrome(); }
       catch (e) { return { ok: false, error: e.message }; }
     }
@@ -2062,6 +2231,13 @@ async function runCommand({ cmd, targetId, args, session }) {
     try {
       let result;
       switch (cmd) {
+        case 'ping': {
+          // Instant daemon liveness: Chrome connection state WITHOUT the
+          // ensureChrome wait (used by `cdp mac-approve` to distinguish
+          // "already connected" from "sheet pending").
+          result = JSON.stringify({ connected: chromeConnected });
+          break;
+        }
         case 'list': {
           const pageListStarted = Date.now();
           const { pages, cacheStatus } = await getPagesCached();
@@ -2743,8 +2919,10 @@ async function getOrStartBrowserDaemon() {
     child.unref();
     log('cli', 'daemon: spawned pid=', child.pid);
 
-    // Wait for the daemon's socket (the daemon itself handles the Chrome
-    // Allow prompt in the background — see connectOnce)
+    // Wait for the daemon's socket. The daemon binds it immediately on
+    // startup, so this loop only matters if the daemon dies mid-spawn; the
+    // actual Chrome "Allow remote debugging?" approval happens while a
+    // command waits for its response (see sendCommandWithMacApprove).
     for (let i = 0; i < DAEMON_CONNECT_RETRIES; i++) {
       await sleep(DAEMON_CONNECT_DELAY);
       try { return await connectToSocket(BROWSER_SOCK); } catch {}
@@ -2752,7 +2930,8 @@ async function getOrStartBrowserDaemon() {
     throw new Error(
       'Chrome debugging is on but the browser rejected the CDP connection. ' +
       'Chrome 151 shows an "Allow debugging" prompt — click Allow in Chrome, ' +
-      'then rerun this command. (Until approved, connections fail.)',
+      'then rerun this command (or run `cdp mac-approve` on macOS to click it ' +
+      'for you). Until approved, connections fail.',
     );
   } finally {
     releaseSpawnLock();
@@ -2811,9 +2990,50 @@ const IPC_RESPONSE_TIMEOUT = 60000;
 // one command, print the result or exit(1) with the daemon's error message.
 async function cliSend(req) {
   const conn = await getOrStartBrowserDaemon();
-  const response = await sendCommand(conn, req);
+  const response = await sendCommandWithMacApprove(conn, req);
   if (!response.ok) { console.error('Error:', response.error); process.exit(1); }
   return response;
+}
+
+// macOS: while a command waits for the daemon's response (the daemon may be
+// blocked on Chrome's per-connection "Allow remote debugging?" sheet — up to
+// 60s), auto-approve the sheet so the user never clicks Allow (browser-harness
+// mac-approve alignment). Opt out with CDP_NO_MAC_APPROVE=1.
+async function sendCommandWithMacApprove(conn, req) {
+  // CDP_NO_MAC_APPROVE=1 opts out of the automatic click (the standalone
+  // `cdp mac-approve` command is still available).
+  if (process.env.CDP_NO_MAC_APPROVE) return sendCommand(conn, req);
+  let macTries = 0;
+  let macNextAt = Date.now() + MAC_APPROVE_START_DELAY_MS;
+  let macDone = false;
+  let settled = false;
+  let outcome;
+  sendCommand(conn, req).then(
+    (v) => { settled = true; outcome = v; },
+    (e) => { settled = true; outcome = e; },
+  );
+  while (!settled) {
+    const wait = macNextAt - Date.now();
+    if (wait > 0) await sleep(wait);
+    if (settled) break;
+    macTries += 1;
+    macNextAt = Date.now() + MAC_APPROVE_ATTEMPT_GAP_MS;
+    const res = macApproveOnce();
+    if (res.status === 'ready') {
+      macDone = true;
+      log('cli', 'mac-approve: clicked Allow');
+      process.stderr.write('cdp: macOS auto-approve clicked Chrome\'s "Allow remote debugging?" — connecting…\n');
+    } else if (res.status === 'accessibility-required') {
+      macDone = true;
+      process.stderr.write(`cdp: cannot auto-approve — ${res.detail}\n`);
+    } else if (res.status === 'setup-required' || res.status === 'unsupported') {
+      macDone = true; // nothing to click; the daemon's error will guide
+    } else if (macTries >= MAC_APPROVE_MAX_ATTEMPTS) {
+      macDone = true; // not-found / error — the sheet never appeared
+    }
+  }
+  if (outcome instanceof Error) throw outcome;
+  return outcome;
 }
 
 function sendCommand(conn, req, { close = true } = {}) {
@@ -2823,7 +3043,12 @@ function sendCommand(conn, req, { close = true } = {}) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       st.pending.delete(id);
-      reject(new Error(`daemon did not respond within ${IPC_RESPONSE_TIMEOUT / 1000}s (cmd: ${req.cmd})`));
+      reject(new Error(
+        `daemon did not respond within ${IPC_RESPONSE_TIMEOUT / 1000}s (cmd: ${req.cmd})` +
+        (process.platform === 'darwin'
+          ? ' — if Chrome is asking for permission, run `cdp mac-approve` and retry'
+          : ''),
+      ));
     }, IPC_RESPONSE_TIMEOUT);
     st.pending.set(id, {
       id, resolve: (v) => { clearTimeout(timer); resolve(v); },
@@ -2913,6 +3138,10 @@ Usage: cdp <command> [args]
                                     e.g. evalraw <t> "DOM.getDocument" '{}'
   open  [url]                       Open url in a blank tab if one exists (reused), else a new tab (default: about:blank)
   stop                              Stop the browser daemon
+  mac-approve                       macOS: auto-click Chrome's "Allow remote
+                                    debugging?" sheet (once; requires
+                                    Accessibility permission for your
+                                    terminal app)
 
 <target> is a unique targetId prefix from "cdp list". If a prefix is ambiguous,
 use more characters.
@@ -2994,6 +3223,28 @@ async function main() {
     }
     args.length = 0;
     args.push(...kept);
+  }
+
+  if (cmd === 'mac-approve') {
+    // Standalone helper: ready when the daemon is already Chrome-connected
+    // (nothing to click); otherwise click the pending sheet, if any. NOTE:
+    // the daemon socket being up is NOT enough — it binds before Chrome
+    // approves (hence the ping probe).
+    let daemonConnected = false;
+    try {
+      const conn = await connectToSocket(BROWSER_SOCK);
+      const r = await sendCommand(conn, { cmd: 'ping' });
+      daemonConnected = JSON.parse(r.result).connected === true;
+      conn.end();
+    } catch {}
+    if (daemonConnected) {
+      console.log('ready');
+      process.exit(0);
+    }
+    const res = macApproveOnce();
+    if (res.detail) console.log(`${res.status}: ${res.detail}`);
+    else console.log(res.status);
+    process.exit(res.status === 'ready' ? 0 : 1);
   }
 
   if (cmd === 'list' || cmd === 'ls') {
@@ -3178,6 +3429,11 @@ export {
   inspectGuideDue,
   markInspectOpened,
   closeInspectTabs,
+  MAC_APPROVE_SCRIPT,
+  macApproveScript,
+  classifyMacApprove,
+  runMacApproveScript,
+  macApproveOnce,
 };
 
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;

@@ -15,6 +15,13 @@ Lightweight Chrome DevTools Protocol CLI. Connects directly via WebSocket — no
   403 from Chrome without --remote-allow-origins)
 - If your browser's `DevToolsActivePort` is in a non-standard location, set `CDP_PORT_FILE` to its full path
 - Set `CDP_HOST` if Chrome's debugging socket is not reachable on `127.0.0.1`
+- macOS: `cdp` auto-clicks Chrome's "Allow remote debugging?" popup for you
+  (English "Allow remote debugging?" / Chinese "要允许远程调试吗？" both handled).
+  One-time setup: grant **Accessibility** to your terminal app (iTerm,
+  Terminal, ...) in System Settings > Privacy & Security > Accessibility.
+  Check with `cdp mac-approve` (prints `ready`/`not-found` when working,
+  `accessibility-required` when the grant is missing). Disable auto-approve
+  with `CDP_NO_MAC_APPROVE=1`.
 
 ## Commands
 
@@ -127,7 +134,7 @@ CSS px = screenshot image px / DPR
 - `wait --network-idle` is the SPA-safe counterpart of `--load`: readyState becomes `complete` before framework XHR/fetch settle. It tracks in-flight requests per tab (Network domain enabled at attach, events never replayed — attach happens before navigation, so tracking is complete from navigation start). Long-lived connections (SSE/keepalive/streaming) keep the page busy forever — the wait then times out with `inflight: n`; this matches browser-harness semantics.
 - Browser-mechanic recipes (dialogs, cookies, downloads, drag-and-drop, dropdowns, iframes, shadow DOM, scrolling, tabs, uploads, viewport, PDF, screenshots, network): see `docs/interaction-skills/` — adapted from browser-harness's interaction-skills to this CLI.
 - Every command is appended to an audit log (`~/.cdp/audit.jsonl`, override with `CDP_AUDIT_FILE`): one JSON line with ts/cmd/args-count/arg-lengths/target/session/ok/error/ms. Argument VALUES are scrubbed (eval JS, cookie values, paths never logged). Analyze with `node scripts/audit.mjs` (summary / --errors / --since / --session / --raw); >5MB the log keeps only its tail.
-- Chrome shows an "Allow debugging" modal once per Chrome session. A background browser daemon keeps the CDP connection alive so subsequent commands need no further approval until Chrome disconnects or you run `stop`. The daemon keeps ONE WebSocket connection to Chrome and reconnects with 10s→30s→60s backoff if it drops — in practice Chrome shows the "Allow debugging" popup once per Chrome session and the held connection makes it a one-time click; if a popup reappears it's because the connection dropped (e.g. after Chrome restart).
+- Chrome shows an "Allow debugging" popup once per Chrome session. On macOS the CLI auto-approves it via System Events (`cdp mac-approve` logic) while it waits for the daemon — no clicking, and Chrome is not brought to the foreground. A background browser daemon keeps the CDP connection alive so subsequent commands need no further approval until Chrome disconnects or you run `stop`. The daemon keeps ONE WebSocket connection to Chrome and reconnects with 10s→30s→60s backoff if it drops — in practice the popup appears once per Chrome session and the held connection makes it a one-time event; if a popup reappears it's because the connection dropped (e.g. after Chrome restart). Run `cdp mac-approve` anytime to click a pending popup manually.
 - If Chrome is not running at all, `cdp` launches it automatically with the
   last-used profile — no manual start needed. Chrome 136+ ignores
   `--remote-debugging-port` on the default profile, so debugging comes from
