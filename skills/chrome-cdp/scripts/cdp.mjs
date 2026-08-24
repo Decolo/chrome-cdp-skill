@@ -52,10 +52,13 @@ const INSPECT_MARKER = resolve(RUNTIME_DIR, 'inspect-opened');
 const INSPECT_REOPEN_TTL_MS = 180_000;
 // macOS auto-approve of Chrome's per-connection "Allow remote debugging?"
 // sheet (browser-harness mac-approve alignment). See macApproveOnce below.
+// Timing: Chrome draws the sheet ~0.3s after the connection lands, so the
+// first probe fires at 0.4s and the click lands ~1.2-1.5s after daemon start
+// (measured live). Six attempts at 300ms gaps cover slow draws/machines.
 const MAC_APPROVE_TIMEOUT_MS = 5000;
-const MAC_APPROVE_MAX_ATTEMPTS = 4;
-const MAC_APPROVE_ATTEMPT_GAP_MS = 700;
-const MAC_APPROVE_START_DELAY_MS = 2500;
+const MAC_APPROVE_MAX_ATTEMPTS = 6;
+const MAC_APPROVE_ATTEMPT_GAP_MS = 300;
+const MAC_APPROVE_START_DELAY_MS = 400;
 
 // Append-only log for the CLI and the daemon (both write to the same file,
 // tagged with the process role). Useful when a command silently fails or the
@@ -2998,7 +3001,8 @@ async function cliSend(req) {
 // macOS: while a command waits for the daemon's response (the daemon may be
 // blocked on Chrome's per-connection "Allow remote debugging?" sheet — up to
 // 60s), auto-approve the sheet so the user never clicks Allow (browser-harness
-// mac-approve alignment). Opt out with CDP_NO_MAC_APPROVE=1.
+// mac-approve alignment). First probe at 0.4s (sheet draws in ~0.3s), then
+// every 0.3s; terminal statuses stop the loop. Opt out with CDP_NO_MAC_APPROVE=1.
 async function sendCommandWithMacApprove(conn, req) {
   // CDP_NO_MAC_APPROVE=1 opts out of the automatic click (the standalone
   // `cdp mac-approve` command is still available).
