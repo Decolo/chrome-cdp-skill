@@ -9,10 +9,10 @@
 // a single CDP WebSocket connection to Chrome. Daemon lives until Chrome
 // disconnects or "cdp stop" is called.
 
-import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync, openSync, writeSync, closeSync, statSync, rmdirSync, appendFileSync } from 'fs';
+import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync, openSync, writeSync, closeSync, statSync, rmdirSync, appendFileSync, readdirSync } from 'fs';
 import { homedir } from 'os';
-import { resolve } from 'path';
-import { pathToFileURL } from 'url';
+import { resolve, dirname } from 'path';
+import { pathToFileURL, fileURLToPath } from 'url';
 import { spawn, spawnSync, execFileSync } from 'child_process';
 import net from 'net';
 import { randomBytes, createHash } from 'crypto';
@@ -26,6 +26,11 @@ const COMMAND_HISTORY_LIMIT = 50;
 const AUDIT_MAX_BYTES = 5 * 1024 * 1024;
 const AUDIT_DIR = process.env.CDP_AUDIT_DIR || resolve(homedir(), '.cdp');
 const AUDIT_FILE = process.env.CDP_AUDIT_FILE || resolve(AUDIT_DIR, 'audit.jsonl');
+// Self-improving knowledge: private layer (~/.cdp/knowledge, auto-sedimented,
+// never in git) + repo layer (.cdp-knowledge at repo root, shared seeds).
+const KNOWLEDGE_DIR = process.env.CDP_KNOWLEDGE_DIR || resolve(AUDIT_DIR, 'knowledge');
+const REPO_ROOT_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+const REPO_KNOWLEDGE_DIR = process.env.CDP_REPO_KNOWLEDGE_DIR || resolve(REPO_ROOT_DIR, '.cdp-knowledge');
 const HTML_OUTPUT_LIMIT = 20000;
 const NET_ENTRY_LIMIT = 40;
 const METADATA_CACHE_TTL_MS = 1500;
@@ -1786,6 +1791,70 @@ function readLogTail(n = 8) {
   }
 }
 
+// ---- self-improving knowledge: site notes (browser-harness domain-skills alignment) ----
+
+// Normalize a URL to a site key: https://www.youtube.com/watch?v=x -> 'youtube'
+function siteFromUrl(url) {
+  try {
+    const host = new URL(url).hostname || '';
+    if (!host) return null;
+    return host.replace(/^www\./, '').split('.')[0] || null;
+  } catch { return null; }
+}
+
+// All knowledge files for a site: private layer first, repo layer as fallback.
+function knowledgeFiles(site) {
+  const out = [];
+  for (const [dir, root] of [['private', KNOWLEDGE_DIR], ['repo', REPO_KNOWLEDGE_DIR]]) {
+    const d = resolve(root, site);
+    let names;
+    try { names = readdirSync(d); } catch { continue; }
+    for (const f of names.filter(x => x.endsWith('.md')).sort()) {
+      out.push({ dir, site, file: f, path: resolve(d, f) });
+    }
+  }
+  return out;
+}
+
+// All sites that have any notes (either layer).
+function knowledgeSites() {
+  const sites = new Set();
+  for (const root of [KNOWLEDGE_DIR, REPO_KNOWLEDGE_DIR]) {
+    let names;
+    try { names = readdirSync(root); } catch { continue; }
+    for (const f of names) {
+      try { if (statSync(resolve(root, f)).isDirectory()) sites.add(f); } catch {}
+    }
+  }
+  return [...sites].sort();
+}
+
+// Tail of the audit log as parsed entries (malformed lines skipped).
+function readAuditEntries(limit = 1000) {
+  try {
+    return readFileSync(AUDIT_FILE, 'utf8').trim().split('\n').filter(Boolean).slice(-limit)
+      .map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  } catch { return []; }
+}
+
+// Failed commands for one session (the sediment-review trigger).
+function reviewFailures(entries, session) {
+  return entries.filter(e => e && !e.ok && e.session === session)
+    .map(e => ({ ts: e.ts, cmd: e.cmd, error: String(e.error || '').slice(0, 120) }));
+}
+
+// Per-host stats: nav counts/failures + knowledge reads (the evaluation report).
+function reportStats(entries) {
+  const byHost = {};
+  for (const e of entries) {
+    if (!e || !e.host) continue;
+    byHost[e.host] ||= { nav: 0, navFail: 0, knowledgeReads: 0 };
+    if (e.cmd === 'nav' || e.cmd === 'navigate') { byHost[e.host].nav += 1; if (!e.ok) byHost[e.host].navFail += 1; }
+    if (e.cmd === 'knowledge') byHost[e.host].knowledgeReads += 1;
+  }
+  return byHost;
+}
+
 // Pure: turn collected environment facts into a doctor report (no I/O here).
 // Returns { lines, failCount }.
 function doctorItems(f) {
@@ -2557,6 +2626,50 @@ async function runCommand({ cmd, targetId, args, session }) {
           result = JSON.stringify({ targetId: cur, url: p.url, title: p.title, session: sid });
           break;
         }
+        case 'knowledge': {
+          const arg = args[0] || '';
+          if (arg === '--review') {
+            const fails = reviewFailures(readAuditEntries(300), sid);
+            result = fails.length
+              ? `最近失败命令(会话 ${sid}):\n` +
+                fails.map(f => `  ${f.ts.slice(11, 19)} ${f.cmd} — ${f.error}`).join('\n') +
+                `\n→ 踩坑值得沉淀:cdp knowledge <site> 查看笔记,或直接写笔记文件`
+              : `会话 ${sid} 最近无失败命令,无需沉淀`;
+            break;
+          }
+          if (arg === '--report') {
+            const byHost = reportStats(readAuditEntries(1000));
+            const hosts = Object.keys(byHost).sort();
+            result = hosts.length
+              ? `按站点统计(audit 近 1000 条):\n` +
+                hosts.map(h => {
+                  const s = byHost[h];
+                  const rate = s.nav ? `${(100 * s.navFail / s.nav).toFixed(0)}%` : '-';
+                  return `  ${h}: nav ${s.nav} 次(失败 ${rate}),知识读取 ${s.knowledgeReads} 次`;
+                }).join('\n') +
+                `\n→ 对比:有笔记的站 vs 无笔记的站,失败率是否更低`
+              : `暂无 host 统计(需要 nav 命令的日志)`;
+            break;
+          }
+          const site = arg;
+          if (!site) {
+            const sites = knowledgeSites();
+            result = sites.length
+              ? `已有笔记的站点:\n` +
+                sites.map(s => {
+                  const fs = knowledgeFiles(s);
+                  const mark = fs.some(f => f.dir === 'private') ? ' (含私人)' : '';
+                  return `  ${s} — ${fs.length} 条${mark}`;
+                }).join('\n')
+              : `还没有任何站点笔记(私人 ${KNOWLEDGE_DIR}/ 与公共 ${REPO_KNOWLEDGE_DIR}/ 都是空的)`;
+          } else {
+            const files = knowledgeFiles(site);
+            result = files.length
+              ? files.map(f => `# [${f.dir}] ${f.file}\n${readFileSync(f.path, 'utf8').trim()}`).join('\n\n')
+              : `暂无 ${site} 的笔记(私人 ${KNOWLEDGE_DIR}/${site}/ 与公共 ${REPO_KNOWLEDGE_DIR}/${site}/ 都没有)\n→ 首次成功完成任务后可在此沉淀第一条`;
+          }
+          break;
+        }
         case 'stats': {
           result = await statsStr();
           break;
@@ -2710,9 +2823,18 @@ async function runCommand({ cmd, targetId, args, session }) {
                 commandResult = await htmlStr(cdp, sessionId, selector, options);
                 break;
               }
-              case 'nav': case 'navigate':
+              case 'nav': case 'navigate': {
                 commandResult = await navStr(cdp, sessionId, args[0]);
+                const site = siteFromUrl(args[0]);
+                if (site) {
+                  const files = knowledgeFiles(site);
+                  commandResult += files.length
+                    ? `\nknowledge: ${site} — ${files.length} 条 (cdp knowledge ${site} 查看)`
+                    : `\nknowledge: ${site} — 尚无笔记(首次成功后可沉淀)`;
+                }
                 break;
+              }
+
               case 'net': case 'network':
                 commandResult = await netStr(cdp, sessionId, parseNetArgs(args));
                 break;
@@ -2866,17 +2988,21 @@ async function runCommand({ cmd, targetId, args, session }) {
     }
     if (req.cmd !== 'list_raw') {
       const args = Array.isArray(req.args) ? req.args : [];
-      appendAudit({
+      const entry = {
         ts: new Date().toISOString(),
         cmd: req.cmd,
         args: args.length,
         argChars: args.join(' ').length,
         target: String(req.targetId || ''),
         session: String(req.session || 'default'),
-        ok: !!res.ok,
-        error: res.ok ? '' : String(res.error || '').slice(0, 200),
-        ms: Date.now() - started,
-      });
+        host: '',
+      };
+      if ((req.cmd === 'nav' || req.cmd === 'navigate') && args[0]) entry.host = siteFromUrl(args[0]) || '';
+      else if (req.cmd === 'knowledge' && args[0] && !args[0].startsWith('--')) entry.host = args[0];
+      entry.ok = !!res.ok;
+      entry.error = res.ok ? '' : String(res.error || '').slice(0, 200);
+      entry.ms = Date.now() - started;
+      appendAudit(entry);
     }
     return res;
   }
@@ -3245,6 +3371,9 @@ Usage: cdp <command> [args]
   stats                             Show browser daemon health and recent command timings
   doctor                            Diagnose install/daemon/Chrome state and print
                                     fix hints; exits 1 if anything is broken
+  knowledge [site|--review|--report]  Site notes for self-improving: list notes for a
+                                    site (private + repo layers), list all sites,
+                                    review recent session failures, or per-site stats
   inspect <target> [selector] [--limit <n>] [--sections a,b,c] [--text-max <n>] [--no-text]
                                     Lightweight page summary with optional section/output scoping
   snap  <target>                    Accessibility tree snapshot
@@ -3409,6 +3538,12 @@ async function main() {
     const response = await cliSend({ cmd: 'stats', args: [] });
     console.log(response.result);
     return;
+  }
+
+  if (cmd === 'knowledge') {
+    const response = await cliSend({ cmd: 'knowledge', args, session });
+    console.log(response.ok ? response.result : response.error);
+    process.exit(response.ok ? 0 : 1);
   }
 
   if (cmd === 'doctor') {
@@ -3590,6 +3725,12 @@ export {
   clickXyEvents,
   parseClickxyArgs,
   doctorItems,
+  siteFromUrl,
+  knowledgeFiles,
+  knowledgeSites,
+  readAuditEntries,
+  reviewFailures,
+  reportStats,
   MAC_APPROVE_SCRIPT,
   macApproveScript,
   classifyMacApprove,

@@ -120,6 +120,47 @@ CSS px = screenshot image px / DPR
 
 `shot` prints the DPR for the current page. Typical Retina (DPR=2): divide screenshot coords by 2.
 
+## Self-Improving(认知层)
+
+站点级经验自动沉淀:踩过的坑、验证过的操作序列,按站点存为 markdown 笔记。
+机制:**nav 自动提示该站有无笔记 → `cdp knowledge` 读 → 踩坑/首成功写回**。
+
+### 命令
+
+```bash
+scripts/cdp.mjs knowledge <site>          # 列出该站全部笔记(私人层 + 公共层)
+scripts/cdp.mjs knowledge                 # 列出所有有笔记的站点
+scripts/cdp.mjs knowledge --review        # 从 audit 拉当前会话最近失败命令(防漏沉淀)
+scripts/cdp.mjs knowledge --report        # 按站统计 nav 失败率与知识读取次数
+```
+
+### 存储(两层)
+
+- **私人层** `~/.cdp/knowledge/<site>/`(CDP_KNOWLEDGE_DIR 可覆盖):agent 自动沉淀,不进 git
+- **公共层** repo 根 `.cdp-knowledge/<site>/`:共享种子,仅人工挑选复制
+- 查找顺序:私人优先 → 公共兜底
+
+### 硬规则(必须遵守)
+
+1. **读**:`nav` 输出带 `knowledge:` 提示行。有笔记 → 用 `cdp knowledge <site>` 读完再执行;无笔记 → 该站首次成功完成后沉淀第一条
+2. **写**:任务中踩坑/失败 → **当场**写/更新笔记("发生了什么 → 怎么绕过的 → 下次怎么做");顺利执行 → 不写,零浪费
+3. **失效**:按笔记执行某步失败 → 立即更新笔记(标注新日期 + 新路径),退回正常推理
+4. **边界**:只沉淀站点级事实;机制级知识进 `docs/interaction-skills/`;公共层仅人工复制,自动沉淀只进私人层
+
+### 文件格式(最简)
+
+```markdown
+# <笔记名>
+- 日期: 2026-08-24     # 最近一次实测/更新的日期
+- 环境: 需要登录 / 公开
+
+内容自然语言,步骤用列表,{占位符} 参数化,命令写 CLI 形式。
+```
+
+### 评价(按需)
+
+`cdp knowledge --report`:对比有笔记 vs 无笔记站点的失败率,验证沉淀是否真的有效。
+
 ## Tips
 
 - Prefer `inspect` for first-pass page state; use scoped `html` or one combined `eval` before reaching for `snap` or `shot`.
