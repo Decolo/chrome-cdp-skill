@@ -111,3 +111,18 @@ test('macApproveOnce: socket already up -> ready without running osascript', asy
   const r = macApproveOnce({ socketUp: true });
   assert.equal(r.status, 'ready');
 });
+
+test('script clicks EVERY stacked sheet (no early exit)', () => {
+  // Regression for the double-popup bug: rapid daemon restarts stack two
+  // "Allow remote debugging?" sheets; the script must iterate every window
+  // and every sheet, not stop at the first match.
+  assert.ok(!MAC_APPROVE_SCRIPT.includes('exit repeat'),
+    'script must not exit at the first matched sheet');
+  assert.ok(MAC_APPROVE_SCRIPT.includes('repeat with s in sheets of w'),
+    'script must iterate all sheets');
+  assert.ok(MAC_APPROVE_SCRIPT.includes('clickedCount'),
+    'script must count clicks so a single pass can clear stacked sheets');
+  // Both passes (exact + lenient) must remain present.
+  assert.ok(MAC_APPROVE_SCRIPT.includes('is "Allow remote debugging?"'));
+  assert.ok(MAC_APPROVE_SCRIPT.includes('contains "remote debugging"'));
+});
