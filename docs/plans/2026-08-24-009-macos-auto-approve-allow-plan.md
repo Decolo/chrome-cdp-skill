@@ -167,3 +167,16 @@ Live 验证(Chrome 重启一次,已获用户同意):
    `node` (agent host), the grant goes to node and CLI-side approve still
    works.
 3. Daemon-side best-effort approve: NOT in this batch (user decision).
+
+
+## Addendum 7: 堆叠弹窗修复 (2026-08-24)
+
+现象:daemon 频繁重启/重连时,Chrome 可能堆叠两个 "Allow remote debugging?" sheet
+(每个新连接弹一个),旧脚本找到第一个匹配 sheet 即 exit,第二个残留 → 连接一直
+pending("偶尔不会自动 allow")+ 用户看到连续两个弹窗。
+
+修复:AppleScript 改为遍历所有窗口的所有 sheet,一次点掉全部匹配项(exact 中文/英文
+pass + lenient 151+ 重命名 pass,clickedCount 统计);osacompile 编译验证 + 单 sheet
+live 验证通过(重启 daemon → cdp list → clicked Allow → exit 0)。10/10 macos-approve
+测试保持通过。已知边界:daemon 后台重连弹出的 sheet 仍需下一个 CLI 命令的等待窗口
+才会被点(daemon 侧不主动批准,009 决策)。

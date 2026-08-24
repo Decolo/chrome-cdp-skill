@@ -310,10 +310,15 @@ const MAC_APPROVE_SCRIPT = `using terms from application "System Events"
 end using terms from
 
 set resultText to "not-found"
+set clickedCount to 0
 set targetProcess to "__CDP_CHROME_PROCESS__"
 tell application "System Events"
 	if exists process targetProcess then
 		tell process targetProcess
+			-- Click EVERY matching sheet in every window: rapid daemon
+			-- restarts can stack two sheets (one per connection). Stopping
+			-- at the first match leaves the rest pending, so the daemon
+			-- never connects and the user sees leftover popups.
 			-- exact pass: English and Chinese sheet titles (Chrome is
 			-- localized; browser-harness matches only the English title)
 			repeat with w in windows
@@ -321,32 +326,23 @@ tell application "System Events"
 					repeat with s in sheets of w
 						if (name of s as text) is "Allow remote debugging?" or ¬
 							(name of s as text) is "要允许远程调试吗？" then
-							if my clickAllow(s) then
-								set resultText to "ready"
-								exit repeat
-							end if
+							if my clickAllow(s) then set clickedCount to clickedCount + 1
 						end if
 					end repeat
 				end try
-				if resultText is "ready" then exit repeat
 			end repeat
-			if resultText is "not-found" then
-				-- lenient pass: Chrome may reword the sheet (151+)
-				repeat with w in windows
-					try
-						repeat with s in sheets of w
-							if (name of s as text) contains "remote debugging" or ¬
-								(name of s as text) contains "远程调试" then
-								if my clickAllow(s) then
-									set resultText to "ready"
-									exit repeat
-								end if
-							end if
-						end repeat
-					end try
-					if resultText is "ready" then exit repeat
-				end repeat
-			end if
+			-- lenient pass: Chrome may reword the sheet (151+)
+			repeat with w in windows
+				try
+					repeat with s in sheets of w
+						if (name of s as text) contains "remote debugging" or ¬
+							(name of s as text) contains "远程调试" then
+							if my clickAllow(s) then set clickedCount to clickedCount + 1
+						end if
+					end repeat
+				end try
+			end repeat
+			if clickedCount > 0 then set resultText to "ready"
 		end tell
 	end if
 end tell
