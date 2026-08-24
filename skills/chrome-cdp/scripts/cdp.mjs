@@ -1802,11 +1802,21 @@ function siteFromUrl(url) {
   } catch { return null; }
 }
 
+// Site keys are dotted host-like tokens only (github, example.com, mail.google.com):
+// dot-separated alphanumeric segments, so "..", "../x" or anything path-unsafe can
+// never escape the knowledge roots or leak values into the audit log.
+const SITE_KEY_RE = /^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*$/;
+function isValidSiteKey(site) {
+  return typeof site === 'string' && SITE_KEY_RE.test(site) && site.length <= 64;
+}
+
 // All knowledge files for a site: private layer first, repo layer as fallback.
 function knowledgeFiles(site) {
   const out = [];
   for (const [dir, root] of [['private', KNOWLEDGE_DIR], ['repo', REPO_KNOWLEDGE_DIR]]) {
+    const base = resolve(root) + '/';
     const d = resolve(root, site);
+    if (!d.startsWith(base)) continue; // belt & braces against traversal
     let names;
     try { names = readdirSync(d); } catch { continue; }
     for (const f of names.filter(x => x.endsWith('.md')).sort()) {
@@ -2429,7 +2439,7 @@ const agentSessions = new Map();
 
 async function runCommand({ cmd, targetId, args, session }) {
     const sid = session || 'default';
-    if (cmd !== 'stats' && cmd !== 'stop' && cmd !== 'ping') {  // keep in sync with handleCommand's audit/record skip
+    if (cmd !== 'stats' && cmd !== 'stop' && cmd !== 'ping' && cmd !== 'knowledge') {  // keep in sync with handleCommand's audit/record skip
       try { await ensureChrome(); }
       catch (e) { return { ok: false, error: e.message }; }
     }
@@ -2652,6 +2662,10 @@ async function runCommand({ cmd, targetId, args, session }) {
             break;
           }
           const site = arg;
+          if (site && !isValidSiteKey(site)) {
+            result = `invalid site key '${site}' — use a host-like name (github, example.com); no paths allowed`;
+            break;
+          }
           if (!site) {
             const sites = knowledgeSites();
             result = sites.length
@@ -2998,7 +3012,7 @@ async function runCommand({ cmd, targetId, args, session }) {
         host: '',
       };
       if ((req.cmd === 'nav' || req.cmd === 'navigate') && args[0]) entry.host = siteFromUrl(args[0]) || '';
-      else if (req.cmd === 'knowledge' && args[0] && !args[0].startsWith('--')) entry.host = args[0];
+      else if (req.cmd === 'knowledge' && args[0] && isValidSiteKey(args[0])) entry.host = args[0];
       entry.ok = !!res.ok;
       entry.error = res.ok ? '' : String(res.error || '').slice(0, 200);
       entry.ms = Date.now() - started;
@@ -3726,7 +3740,9 @@ export {
   parseClickxyArgs,
   doctorItems,
   siteFromUrl,
+  isValidSiteKey,
   knowledgeFiles,
+  readLogTail,
   knowledgeSites,
   readAuditEntries,
   reviewFailures,

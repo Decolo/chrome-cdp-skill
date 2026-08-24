@@ -45,14 +45,14 @@ audit 的 nav 记录补 host 字段(评价需要按站聚合)。
 helper 调用翻译成 CLI 命令,标注出处(MIT,附来源)。
 
 ## 任务清单
-- [ ] B1. repo 建 .cdp-knowledge/ 骨架(README 格式说明)
-- [ ] B2. 私人层建 ~/.cdp/knowledge/(README)
-- [ ] B3. cdp.mjs:`cdp knowledge <site>` 查询 + `--review` + `--report`;nav 提示行;audit 加 host
-- [ ] B4. SKILL.md「Self-Improving」章节(读/写/触发规则)
-- [ ] B5. 种子移植(browser-harness domain-skills → CLI 语法,3-5 站)
-- [ ] B6. 测试(knowledge 命令单元测试)
-- [ ] B7. 闭环验证:真实 Chrome 跑一个站点任务 → 沉淀 → 查→跑
-- [ ] B8. commit + push(仅公共层;~/.cdp/ 不进 git)
+- [x] B1. repo 建 .cdp-knowledge/ 骨架(README 格式说明)
+- [x] B2. 私人层建 ~/.cdp/knowledge/(README)
+- [x] B3. cdp.mjs:`cdp knowledge <site>` 查询 + `--review` + `--report`;nav 提示行;audit 加 host
+- [x] B4. SKILL.md「Self-Improving」章节(读/写/触发规则)
+- [x] B5. 种子移植(browser-harness domain-skills → CLI 语法,3-5 站)
+- [x] B6. 测试(knowledge 命令单元测试)
+- [x] B7. 闭环验证:真实 Chrome 跑一个站点任务 → 沉淀 → 查→跑
+- [x] B8. commit + push(仅公共层;~/.cdp/ 不进 git)
 
 ## 已定决策(不再讨论)
 - 不做 recipes/memory 分层(文字游戏)
@@ -70,3 +70,15 @@ helper 调用翻译成 CLI 命令,标注出处(MIT,附来源)。
 - 闭环验证通过(见 todo Review 区)
 - 已知边界:写入靠 agent 规则 + --review 兜底(工具无法判定任务成败);
   评价按需(--report);audit 旧行无 host 不影响新统计
+
+
+## Addendum 2: review 修复 (2026-08-24)
+
+Review agent(独立子代理)审查 864aad4 + 998a485,无 P0,2 个 P1 已修:
+1. audit 隐私:knowledge 的 site 参数曾原样写入 audit host 字段(如
+   `cdp knowledge https://x/y?q=secret` 泄漏完整 URL)——现在 site key 经
+   isValidSiteKey 校验(host-like 点分 token),非法值拒绝且 audit 记空
+2. 路径穿越:knowledgeFiles 曾接受 `..` 等逃逸路径——正则 + resolve 包含检查双防
+3. 可用性:knowledge(--review/--report 纯本地读)不再强制等 Chrome 连接,
+   加入 ensureChrome skip 列表(与 doctor 一致)
+P2 顺手:readLogTail 导出 + 测试;测试补 isValidSiteKey/路径防御回归。

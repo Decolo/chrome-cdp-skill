@@ -23,6 +23,16 @@ test('siteFromUrl normalizes hosts to site keys', () => {
   assert.equal(siteFromUrl('not a url'), null);
 });
 
+test('isValidSiteKey: accepts host-like keys, rejects traversal/URLs', () => {
+  const { isValidSiteKey } = mod;
+  for (const ok of ['github', 'example.com', 'mail.google.com', 'a1-b2.io']) {
+    assert.ok(isValidSiteKey(ok), `should accept: ${ok}`);
+  }
+  for (const bad of ['..', '../x', 'https://x/y?q=1', 'a/b', 'a b', '', 'x'.repeat(65)]) {
+    assert.ok(!isValidSiteKey(bad), `should reject: ${bad}`);
+  }
+});
+
 test('knowledgeFiles: private layer first, repo layer fallback', async (t) => {
   const priv = mkdtempSync(join(tmpdir(), 'cdp-know-priv-'));
   const repo = mkdtempSync(join(tmpdir(), 'cdp-know-repo-'));
@@ -40,6 +50,11 @@ test('knowledgeFiles: private layer first, repo layer fallback', async (t) => {
   const files = m.knowledgeFiles('github');
   assert.deepEqual(files.map(f => [f.dir, f.file]), [['private', 'a.md'], ['repo', 'a.md'], ['repo', 'b.md']]);
   assert.deepEqual(m.knowledgeSites(), ['github']);
+});
+
+test('readLogTail exported and returns a string', () => {
+  assert.equal(typeof mod.readLogTail, 'function');
+  assert.equal(typeof mod.readLogTail(3), 'string');
 });
 
 test('reviewFailures filters failed commands of one session', () => {
