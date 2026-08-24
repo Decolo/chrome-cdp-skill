@@ -1726,16 +1726,158 @@ async function clickStr(cdp, sid, selector) {
 }
 
 // Click at CSS pixel coordinates using Input.dispatchMouseEvent
-async function clickXyStr(cdp, sid, x, y) {
+// Pure: build the Input.dispatchMouseEvent sequence for one clickxy call.
+// A double click is two full press/release cycles (clickCount 1,1,2,2) so the
+// page sees real mousedown/mouseup pairs plus dblclick — same as a human.
+// (browser-harness sends a single press/release with clickCount=clicks; the
+// real sequence is more faithful and still triggers dblclick.)
+function clickXyEvents(x, y, button, clicks) {
+  const evts = [{ type: 'mouseMoved', x, y, button, clickCount: 0, modifiers: 0 }];
+  for (let i = 1; i <= clicks; i++) {
+    evts.push({ type: 'mousePressed', x, y, button, clickCount: i, modifiers: 0 });
+    evts.push({ type: 'mouseReleased', x, y, button, clickCount: i, modifiers: 0 });
+  }
+  return evts;
+}
+
+// Pure: parse `clickxy` command args (after target): x y [--button left|right|middle] [--clicks 1|2]
+function parseClickxyArgs(args) {
+  if (args.length < 2) throw new Error('x and y required (CSS pixels)');
+  const x = parseFloat(args[0]);
+  const y = parseFloat(args[1]);
+  if (isNaN(x) || isNaN(y)) throw new Error('x and y must be numbers (CSS pixels)');
+  let button = 'left';
+  let clicks = 1;
+  for (let i = 2; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--button') {
+      button = args[++i];
+      if (!['left', 'right', 'middle'].includes(button)) throw new Error(`--button must be left|right|middle (got '${button}')`);
+    } else if (a === '--clicks') {
+      clicks = parseInt(args[++i], 10);
+      if (![1, 2].includes(clicks)) throw new Error(`--clicks must be 1 or 2 (got '${clicks}')`);
+    } else {
+      throw new Error(`unknown clickxy option: '${a}'`);
+    }
+  }
+  return { x, y, button, clicks };
+}
+
+async function clickXyStr(cdp, sid, x, y, button = 'left', clicks = 1) {
   const cx = parseFloat(x);
   const cy = parseFloat(y);
   if (isNaN(cx) || isNaN(cy)) throw new Error('x and y must be numbers (CSS pixels)');
-  const base = { x: cx, y: cy, button: 'left', clickCount: 1, modifiers: 0 };
-  await cdp.send('Input.dispatchMouseEvent', { ...base, type: 'mouseMoved' }, sid);
-  await cdp.send('Input.dispatchMouseEvent', { ...base, type: 'mousePressed' }, sid);
-  await sleep(50);
-  await cdp.send('Input.dispatchMouseEvent', { ...base, type: 'mouseReleased' }, sid);
-  return `Clicked at CSS (${cx}, ${cy})`;
+  for (const evt of clickXyEvents(cx, cy, button, clicks)) {
+    await cdp.send('Input.dispatchMouseEvent', evt, sid);
+    if (evt.type === 'mousePressed') await sleep(50);
+  }
+  return `Clicked ${button}${clicks === 2 ? ' (double)' : ''} at CSS (${cx}, ${cy})`;
+}
+
+// ---- cdp doctor: environment diagnostics (browser-harness --doctor alignment) ----
+
+function readLogTail(n = 8) {
+  try {
+    const data = readFileSync(LOG_FILE, 'utf8').trim();
+    if (!data) return '(empty)';
+    return data.split('\n').slice(-n).join('\n');
+  } catch {
+    return '(no log file yet)';
+  }
+}
+
+// Pure: turn collected environment facts into a doctor report (no I/O here).
+// Returns { lines, failCount }.
+function doctorItems(f) {
+  const lines = [];
+  let failCount = 0;
+  const add = (status, name, detail, hint) => {
+    const mark = status === 'ok' ? '[ok]' : status === 'warn' ? '[warn]' : status === 'fail' ? '[FAIL]' : '[info]';
+    lines.push(`${mark} ${name}`);
+    if (detail) lines.push(`      ${detail}`);
+    if (hint) lines.push(`      -> ${hint}`);
+    if (status === 'fail') failCount++;
+  };
+
+  add('info', `platform: ${f.platform} (node ${f.nodeVersion})`);
+  add('info', `runtime dir: ${f.runtimeDir}`);
+
+  // daemon
+  if (f.daemonConnected) {
+    add('ok', 'daemon', 'running and connected to Chrome');
+  } else if (f.daemonPidAlive) {
+    add('warn', 'daemon', 'process alive but not connected to Chrome',
+      f.socketExists ? 'Chrome may be asking for permission — run `cdp mac-approve` or wait for the next command' : 'socket missing — run `cdp stop` then retry');
+  } else if (f.socketExists) {
+    add('warn', 'daemon', 'stale socket without a live process',
+      'run `cdp stop` (or just run any command — it self-heals)');
+  } else {
+    add('info', 'daemon', 'not running (starts automatically on the next command)');
+  }
+
+  // Chrome / remote debugging
+  if (!f.chromeRunning) {
+    add('warn', 'chrome', 'Chrome is not running',
+      '`cdp` can auto-launch it (CDP_CHROME_PATH / CHROME_PATH override)');
+  } else if (!f.portFile) {
+    add('fail', 'remote debugging', 'Chrome is running but no DevToolsActivePort file found',
+      'enable "Allow remote debugging" at chrome://inspect/#remote-debugging, then restart Chrome');
+  } else if (!f.portLive) {
+    add('fail', 'remote debugging', `port file ${f.portFile} exists but the port is not responding`,
+      'restart Chrome, or check for a conflicting process on that port');
+  } else if (!f.switchEnabled) {
+    add('fail', 'remote debugging', `port is live but Local State switch 'devtools.remote_debugging.user-enabled' is off`,
+      'tick "Allow remote debugging" at chrome://inspect/#remote-debugging (keep it on), then restart Chrome');
+  } else {
+    add('ok', 'remote debugging', `enabled (port ${f.port}, Local State switch on)`);
+  }
+
+  if (f.platform === 'darwin') {
+    add('info', 'macOS auto-approve', 'active — your terminal app needs Accessibility permission once (System Settings → Privacy & Security → Accessibility)');
+  }
+
+  return { lines, failCount };
+}
+
+async function doctorCmd() {
+  const f = {};
+  f.platform = process.platform;
+  f.nodeVersion = process.version;
+  f.runtimeDir = RUNTIME_DIR;
+
+  // daemon facts (read-only; ping does not spawn anything)
+  const pid = readDaemonPidFile();
+  f.daemonPidAlive = pid != null && isProcessAlive(pid);
+  f.socketExists = existsSync(BROWSER_SOCK);
+  f.daemonConnected = false;
+  if (f.socketExists) {
+    try {
+      const conn = await connectToSocket(BROWSER_SOCK);
+      // Short probe: a hung daemon must not stall `doctor` for 60s.
+      const r = await Promise.race([
+        sendCommand(conn, { cmd: 'ping' }),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('ping timeout')), 2000)),
+      ]);
+      f.daemonConnected = JSON.parse(r.result).connected === true;
+      conn.end();
+    } catch {}
+  }
+
+  // chrome facts
+  f.chromeRunning = isBrowserProcessRunning();
+  f.portFile = findDevToolsActivePortFile() || null;
+  f.portLive = f.portFile ? await devToolsPortLive(f.portFile) : false;
+  f.port = null;
+  f.switchEnabled = false;
+  if (f.portFile) {
+    try { f.port = readFileSync(f.portFile, 'utf8').trim().split('\n')[0]; } catch {}
+  }
+  try { f.switchEnabled = localStateUserEnabled(); } catch {}
+
+  const { lines, failCount } = doctorItems(f);
+
+  const out = ['cdp doctor', '='.repeat(60), ...lines, '='.repeat(60), `log tail (${LOG_FILE}):`, readLogTail()];
+  return { text: out.join('\n'), failCount };
 }
 
 // Type text using Input.insertText (works in cross-origin iframes, unlike eval)
@@ -2577,9 +2719,11 @@ async function runCommand({ cmd, targetId, args, session }) {
               case 'click':
                 commandResult = await clickStr(cdp, sessionId, args[0]);
                 break;
-              case 'clickxy':
-                commandResult = await clickXyStr(cdp, sessionId, args[0], args[1]);
+              case 'clickxy': {
+                const p = parseClickxyArgs(args);
+                commandResult = await clickXyStr(cdp, sessionId, p.x, p.y, p.button, p.clicks);
                 break;
+              }
               case 'type':
                 commandResult = await typeStr(cdp, sessionId, args[0]);
                 break;
@@ -3099,6 +3243,8 @@ Usage: cdp <command> [args]
   cookie delete <name> [--domain <host>]
   pdf     <target> [file]           Print the page to a PDF file (default: <prefix>.pdf)
   stats                             Show browser daemon health and recent command timings
+  doctor                            Diagnose install/daemon/Chrome state and print
+                                    fix hints; exits 1 if anything is broken
   inspect <target> [selector] [--limit <n>] [--sections a,b,c] [--text-max <n>] [--no-text]
                                     Lightweight page summary with optional section/output scoping
   snap  <target>                    Accessibility tree snapshot
@@ -3111,7 +3257,9 @@ Usage: cdp <command> [args]
   net   <target> [--limit <n>] [--type <initiator>] [--same-origin]
                                     Slowest network entries with optional narrower scope
   click   <target> <selector>       Click an element by CSS selector
-  clickxy <target> <x> <y>          Click at CSS pixel coordinates (see coordinate note below)
+  clickxy <target> <x> <y> [--button left|right|middle] [--clicks 1|2]
+                                    Click at CSS pixel coordinates; default left click,
+                                    --clicks 2 = double click (see coordinate note below)
   type    <target> <text>           Type text at current focus via Input.insertText
                                     Works in cross-origin iframes unlike eval-based approaches
   loadall <target> <selector> [ms]  Repeatedly click a "load more" button until it disappears
@@ -3261,6 +3409,12 @@ async function main() {
     const response = await cliSend({ cmd: 'stats', args: [] });
     console.log(response.result);
     return;
+  }
+
+  if (cmd === 'doctor') {
+    const r = await doctorCmd();
+    console.log(r.text);
+    process.exit(r.failCount > 0 ? 1 : 0);
   }
 
   // Cross-origin iframes (BH iframe_target): list all, or resolve the first
@@ -3433,6 +3587,9 @@ export {
   inspectGuideDue,
   markInspectOpened,
   closeInspectTabs,
+  clickXyEvents,
+  parseClickxyArgs,
+  doctorItems,
   MAC_APPROVE_SCRIPT,
   macApproveScript,
   classifyMacApprove,

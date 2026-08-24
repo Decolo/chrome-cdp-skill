@@ -82,7 +82,8 @@ scripts/cdp.mjs inspect <target> [selector] [--limit 5] [--sections headings,but
 scripts/cdp.mjs nav     <target> <url>         # navigate and wait for load
 scripts/cdp.mjs net     <target> [--limit 10] [--type fetch] [--same-origin]  # narrower network view
 scripts/cdp.mjs click   <target> <selector>    # click element by CSS selector
-scripts/cdp.mjs clickxy <target> <x> <y>       # click at CSS pixel coords
+scripts/cdp.mjs clickxy <target> <x> <y> [--button left|right|middle] [--clicks 1|2]
+                                                  # click at CSS pixel coords; default left click, --clicks 2 = double click
 scripts/cdp.mjs type    <target> <text>         # Input.insertText at current focus; works in cross-origin iframes unlike eval
 scripts/cdp.mjs loadall <target> <selector> [ms]  # click "load more" until gone (default 1500ms between clicks)
 scripts/cdp.mjs wait    <target> <selector> [--timeout ms] [--visible]  # wait for CSS selector to appear (default 10s); --visible also requires non-hidden + in-layout
@@ -104,6 +105,8 @@ scripts/cdp.mjs open    [url] [--session <id>]    # open url in a blank tab if o
 scripts/cdp.mjs list    [--session <id>]          # tabs; * marks this session's current tab (reuses the single
                                                     browser daemon; auto-launches Chrome with remote debugging if not running)
 scripts/cdp.mjs stats                          # daemon health and recent command timings
+scripts/cdp.mjs doctor                         # diagnose install/daemon/Chrome state; prints fix hints,
+                                                  exits 1 if anything is broken
 scripts/cdp.mjs stop                           # stop the browser daemon
 ```
 
