@@ -63,12 +63,38 @@ test('classifyMacApprove: script outcomes -> ready / not-found / error', () => {
   assert.equal(weird.status, 'error');
 });
 
-test('MAC_APPROVE_SCRIPT: exact sheet name + Allow button press, no interpolation', () => {
-  assert.match(MAC_APPROVE_SCRIPT, /"Allow remote debugging\?"/, 'exact English sheet name match');
-  assert.match(MAC_APPROVE_SCRIPT, /"要允许远程调试吗？"/, 'exact Chinese sheet name match (localized Chrome)');
+test('classifyMacApprove: sheet open but unmatched -> no-match, not a silent not-found', () => {
+  // "no sheet yet" (retry) and "sheet present but nothing matched" (Chrome
+  // changed the dialog) are different failures. Reporting both as not-found is
+  // what let the 151+ AXHeading move go unnoticed for several occurrences.
+  const one = classifyMacApprove({ platform: 'darwin', toggleEnabled: true, exitCode: 0, stdout: 'no-match:1' });
+  assert.equal(one.status, 'no-match');
+  assert.match(one.detail, /1 sheet\(s\) open/);
+  assert.match(one.detail, /isApprovalPrompt/, 'tells the reader which matcher to update');
+
+  const two = classifyMacApprove({ platform: 'darwin', toggleEnabled: true, exitCode: 0, stdout: 'no-match:2' });
+  assert.equal(two.status, 'no-match');
+  assert.match(two.detail, /2 sheet\(s\) open/, 'reports how many sheets were seen');
+});
+
+test('MAC_APPROVE_SCRIPT: subtree match + Allow button press, no interpolation', () => {
+  // Chrome 151+ (verified 153.0.8010.50) renders the dialog itself: the AXSheet
+  // has name = missing value and the title sits on a nested AXHeading, ~5 levels
+  // down. Matching the sheet's own name therefore never fires — the script must
+  // walk the sub-tree and match on content. Both wordings stay covered: the
+  // `contains` form also matches the old exact names, so older Chrome (title on
+  // the sheet itself) keeps working.
+  assert.match(MAC_APPROVE_SCRIPT, /on isApprovalPrompt/, 'matches by walking the sub-tree, not by the sheet name');
+  assert.match(MAC_APPROVE_SCRIPT, /repeat with c in UI elements of node/, 'recurses into children (Chrome 151+ nests the title)');
+  assert.match(MAC_APPROVE_SCRIPT, /if depth > 10 then return false/, 'recursion is depth-bounded');
   assert.match(MAC_APPROVE_SCRIPT, /"AXButton"/, 'button role check');
   assert.match(MAC_APPROVE_SCRIPT, /"Allow"/, 'English button description');
   assert.match(MAC_APPROVE_SCRIPT, /"允许"/, 'Chinese button description');
+  // Button match must stay EXACT. The same sheet also offers 「取消」 and
+  // 「在"设置"中关闭」 — the latter DISABLES remote debugging, so a loose
+  // substring match on the label would click exactly the wrong button.
+  assert.match(MAC_APPROVE_SCRIPT, /is "允许"/, 'button label matched by exact equality');
+  assert.ok(!MAC_APPROVE_SCRIPT.includes('contains "允许"'), 'button label must never be a substring match');
   assert.match(MAC_APPROVE_SCRIPT, /AXPress/, 'presses the button');
   assert.match(MAC_APPROVE_SCRIPT, /clickAllow/, 'recursive UI-tree walk');
   assert.match(MAC_APPROVE_SCRIPT, /contains "remote debugging"/, 'lenient pass for Chrome 151+ wording');
@@ -122,7 +148,9 @@ test('script clicks EVERY stacked sheet (no early exit)', () => {
     'script must iterate all sheets');
   assert.ok(MAC_APPROVE_SCRIPT.includes('clickedCount'),
     'script must count clicks so a single pass can clear stacked sheets');
-  // Both passes (exact + lenient) must remain present.
-  assert.ok(MAC_APPROVE_SCRIPT.includes('is "Allow remote debugging?"'));
-  assert.ok(MAC_APPROVE_SCRIPT.includes('contains "remote debugging"'));
+  // Both wordings must remain covered. They now ride on the sub-tree match
+  // (isApprovalPrompt) instead of the two sheet-name passes, but dropping
+  // either language would silently break localized Chrome.
+  assert.ok(MAC_APPROVE_SCRIPT.includes('contains "remote debugging"'), 'English wording covered');
+  assert.ok(MAC_APPROVE_SCRIPT.includes('contains "远程调试"'), 'Chinese wording covered');
 });

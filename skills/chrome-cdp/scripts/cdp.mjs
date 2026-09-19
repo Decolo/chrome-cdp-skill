@@ -290,14 +290,48 @@ function openUrlViaAppleScript(url) {
 // Privacy & Security > Accessibility — a one-time grant; after that the CLI
 // approves the sheet automatically and the user never clicks Allow.
 // Opt out with CDP_NO_MAC_APPROVE=1.
+//
+// Chrome 151+ renders this dialog itself (verified on 153.0.8010.50): the
+// AXSheet has NO title (name = missing value) and the prompt text lives on a
+// nested AXHeading — "Allow remote debugging?" / "要允许远程调试吗？" — about
+// five levels down. Matching the sheet's own `name` therefore never fires, and
+// neither does a looser `contains` on that same property. Match on subtree
+// CONTENT instead, which covers both the old layout (title on the sheet) and
+// the new one, and survives further nesting changes that a positional match
+// would not.
 const MAC_APPROVE_SCRIPT = `using terms from application "System Events"
+	on isApprovalPrompt(node, depth)
+		if depth > 10 then return false
+		try
+			set n to (name of node as text)
+			if n contains "remote debugging" or n contains "远程调试" then return true
+		end try
+		try
+			repeat with c in UI elements of node
+				if my isApprovalPrompt(c, depth + 1) then return true
+			end repeat
+		end try
+		return false
+	end isApprovalPrompt
+
 	on clickAllow(nodeRef)
 		try
-			if (role of nodeRef as text) is "AXButton" and ¬
-				((description of nodeRef as text) is "Allow" or ¬
-				 (description of nodeRef as text) is "允许") then
-				perform action "AXPress" of nodeRef
-				return true
+			if (role of nodeRef as text) is "AXButton" then
+				set d to ""
+				set nm to ""
+				try
+					set d to (description of nodeRef as text)
+				end try
+				try
+					set nm to (name of nodeRef as text)
+				end try
+				-- Exact equality only. The sheet also offers "取消" and
+				-- "在"设置"中关闭" — the latter DISABLES remote debugging, so a
+				-- loose substring match here would be actively harmful.
+				if d is "Allow" or d is "允许" or nm is "Allow" or nm is "允许" then
+					perform action "AXPress" of nodeRef
+					return true
+				end if
 			end if
 		end try
 		try
@@ -311,6 +345,7 @@ end using terms from
 
 set resultText to "not-found"
 set clickedCount to 0
+set sheetCount to 0
 set targetProcess to "__CDP_CHROME_PROCESS__"
 tell application "System Events"
 	if exists process targetProcess then
@@ -319,30 +354,30 @@ tell application "System Events"
 			-- restarts can stack two sheets (one per connection). Stopping
 			-- at the first match leaves the rest pending, so the daemon
 			-- never connects and the user sees leftover popups.
-			-- exact pass: English and Chinese sheet titles (Chrome is
-			-- localized; browser-harness matches only the English title)
+			-- One pass: isApprovalPrompt matches on subtree content, so it
+			-- covers both the English and Chinese titles wherever Chrome
+			-- puts them (the old exact/lenient split checked only the sheet's
+			-- own name and missed Chrome 151+'s nested AXHeading).
 			repeat with w in windows
 				try
 					repeat with s in sheets of w
-						if (name of s as text) is "Allow remote debugging?" or ¬
-							(name of s as text) is "要允许远程调试吗？" then
+						set sheetCount to sheetCount + 1
+						if my isApprovalPrompt(s, 0) then
 							if my clickAllow(s) then set clickedCount to clickedCount + 1
 						end if
 					end repeat
 				end try
 			end repeat
-			-- lenient pass: Chrome may reword the sheet (151+)
-			repeat with w in windows
-				try
-					repeat with s in sheets of w
-						if (name of s as text) contains "remote debugging" or ¬
-							(name of s as text) contains "远程调试" then
-							if my clickAllow(s) then set clickedCount to clickedCount + 1
-						end if
-					end repeat
-				end try
-			end repeat
-			if clickedCount > 0 then set resultText to "ready"
+			-- Distinguish "no sheet drawn yet" (retry — the daemon polls
+			-- until 0.4s after the sheet starts appearing) from "a sheet IS
+			-- open but nothing in it matched" (a Chrome dialog change; the
+			-- old code reported both as not-found, which is why the 151+
+			-- AXHeading move went unnoticed for several occurrences).
+			if clickedCount > 0 then
+				set resultText to "ready"
+			else if sheetCount > 0 then
+				set resultText to "no-match:" & sheetCount
+			end if
 		end tell
 	end if
 end tell
@@ -364,8 +399,8 @@ function macApproveScript(app = process.env.CDP_CHROME_APP) {
 }
 
 // Pure classifier (unit-tested). Statuses mirror browser-harness mac-approve:
-// ready / setup-required / accessibility-required / not-found / error /
-// unsupported.
+// ready / setup-required / accessibility-required / not-found / no-match /
+// error / unsupported.
 function classifyMacApprove({ platform = process.platform, toggleEnabled, socketUp = false, exitCode = null, timedOut = false, stdout = '', stderr = '' } = {}) {
   if (socketUp) return { status: 'ready', detail: null };
   if (platform !== 'darwin') return { status: 'unsupported', detail: 'macOS only' };
@@ -386,6 +421,13 @@ function classifyMacApprove({ platform = process.platform, toggleEnabled, socket
   }
   if (out === 'ready') return { status: 'ready', detail: null };
   if (out === 'not-found') return { status: 'not-found', detail: 'no "Allow remote debugging?" sheet visible' };
+  if (out.startsWith('no-match:')) {
+    return {
+      status: 'no-match',
+      detail: `${out.slice('no-match:'.length)} sheet(s) open but none matched the remote-debugging prompt` +
+        ' — Chrome likely changed the dialog again (see isApprovalPrompt in MAC_APPROVE_SCRIPT)',
+    };
+  }
   return { status: 'error', detail: `unexpected osascript output: ${out || '<empty>'}` };
 }
 
