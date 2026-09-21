@@ -472,6 +472,36 @@ function macApproveOnce({ socketUp = false } = {}) {
   });
 }
 
+// Statuses where polling again cannot change anything: either the click landed,
+// or no click is possible on this machine (platform/permissions/setup).
+const MAC_APPROVE_TERMINAL = new Set(['ready', 'unsupported', 'setup-required', 'accessibility-required']);
+
+// Poll for Chrome's per-connection "Allow remote debugging?" sheet and click
+// it. Chrome draws the sheet ~0.3s after the connection lands, so the first
+// probe fires at 0.4s and the click lands ~1.2-1.5s in (measured live); six
+// attempts at 300ms cover slow draws. `isDone` ends the loop as soon as
+// whatever we were waiting for has settled.
+//
+// Shared by the CLI (waiting on the daemon) AND the daemon (reconnecting).
+// The daemon half is the important one: the sheet is MODAL, so a sheet nobody
+// clicks freezes the entire browser until the user notices. "Leave it up for
+// the user" is not a plan when the sheet only appears on a reconnect the user
+// never asked for.
+async function macApproveWhile(isDone = () => false, role = 'cli') {
+  await sleep(MAC_APPROVE_START_DELAY_MS);
+  for (let i = 0; i < MAC_APPROVE_MAX_ATTEMPTS; i++) {
+    if (isDone()) return null;
+    const res = macApproveOnce();
+    if (res.status === 'ready') {
+      log(role, 'mac-approve: clicked Allow');
+      return res;
+    }
+    if (MAC_APPROVE_TERMINAL.has(res.status)) return res;
+    await sleep(MAC_APPROVE_ATTEMPT_GAP_MS);
+  }
+  return { status: 'not-found', detail: 'no "Allow remote debugging?" sheet visible' };
+}
+
 // Bounded daemon-socket liveness probe (standalone `cdp mac-approve` uses it;
 // connectToSocket alone would hang forever when no daemon is running).
 function socketUp(timeoutMs = 1000) {
@@ -2094,8 +2124,12 @@ async function runBrowserDaemon() {
   log('daemon', 'starting, pid=', process.pid, 'socket=', sp);
   // Chrome 151 shows an "Allow debugging" popup per NEW WebSocket connection.
   // The daemon keeps one connection for its whole life; on failure it stays up
-  // and retries with exponential backoff (connectOnce below), so the modal is
-  // present for the user to click at any time instead of racing a command.
+  // and retries with exponential backoff (connectOnce below).
+  //
+  // Each retry draws that modal, and the daemon — not the CLI, not the user —
+  // has to click it: the modal blocks ALL of Chrome while it is up, and the
+  // CLI only polls for it while one of its own commands is in flight. A daemon
+  // that merely retried left a freeze behind on every reconnect.
   let chromeConnected = false;
   let connectRetryTimer = null;
   let connectInFlight = false;
@@ -2104,6 +2138,17 @@ async function runBrowserDaemon() {
     if (connectInFlight) return false; // serialise: connect+setAutoAttach can
     // outlast a retry interval; a second connect would orphan the first socket.
     connectInFlight = true;
+    let usable = false;
+    // Chrome draws its per-connection "Allow remote debugging?" sheet while
+    // this connect is in flight — approve it from here. The daemon is the only
+    // actor guaranteed to be alive at that moment: the CLI only approves while
+    // one of its commands is in flight, and nobody is watching a browser they
+    // did not touch. The sheet is MODAL, so an unclicked one blocks all of
+    // Chrome until the user notices — which is exactly the freeze this loop
+    // exists to prevent.
+    const approveLoop = macApproveWhile(() => usable, 'daemon').catch((e) => {
+      log('daemon', 'mac-approve loop failed:', (e && e.message) || e);
+    });
     try {
       await cdp.connect(getWsUrl(), 8000);
       await closeInspectTabs(cdp);
@@ -2117,6 +2162,7 @@ async function runBrowserDaemon() {
       // otherwise a half-initialised connect leaves the daemon unable to
       // retry (the retry guard checks chromeConnected).
       chromeConnected = true;
+      usable = true; // stops approveLoop before it can click a later sheet
       connectFails = 0;
       log('daemon', 'connected to Chrome');
       if (connectRetryTimer) { clearTimeout(connectRetryTimer); connectRetryTimer = null; }
@@ -3321,45 +3367,25 @@ async function cliSend(req) {
 }
 
 // macOS: while a command waits for the daemon's response (the daemon may be
-// blocked on Chrome's per-connection "Allow remote debugging?" sheet — up to
-// 60s), auto-approve the sheet so the user never clicks Allow (browser-harness
-// mac-approve alignment). First probe at 0.4s (sheet draws in ~0.3s), then
-// every 0.3s; terminal statuses stop the loop. Opt out with CDP_NO_MAC_APPROVE=1.
+// blocked on Chrome's per-connection "Allow remote debugging?" sheet), approve
+// the sheet so the user never clicks Allow (browser-harness mac-approve
+// alignment). Shares macApproveWhile with the daemon's reconnect path — the
+// daemon is what actually covers a reconnect with no command in flight.
+// Opt out with CDP_NO_MAC_APPROVE=1.
 async function sendCommandWithMacApprove(conn, req) {
   // CDP_NO_MAC_APPROVE=1 opts out of the automatic click (the standalone
   // `cdp mac-approve` command is still available).
   if (process.env.CDP_NO_MAC_APPROVE) return sendCommand(conn, req);
-  let macTries = 0;
-  let macNextAt = Date.now() + MAC_APPROVE_START_DELAY_MS;
-  let macDone = false;
   let settled = false;
-  let outcome;
-  sendCommand(conn, req).then(
-    (v) => { settled = true; outcome = v; },
-    (e) => { settled = true; outcome = e; },
-  );
-  while (!settled) {
-    const wait = macNextAt - Date.now();
-    if (wait > 0) await sleep(wait);
-    if (settled) break;
-    macTries += 1;
-    macNextAt = Date.now() + MAC_APPROVE_ATTEMPT_GAP_MS;
-    const res = macApproveOnce();
-    if (res.status === 'ready') {
-      macDone = true;
-      log('cli', 'mac-approve: clicked Allow');
-      process.stderr.write('cdp: macOS auto-approve clicked Chrome\'s "Allow remote debugging?" — connecting…\n');
-    } else if (res.status === 'accessibility-required') {
-      macDone = true;
-      process.stderr.write(`cdp: cannot auto-approve — ${res.detail}\n`);
-    } else if (res.status === 'setup-required' || res.status === 'unsupported') {
-      macDone = true; // nothing to click; the daemon's error will guide
-    } else if (macTries >= MAC_APPROVE_MAX_ATTEMPTS) {
-      macDone = true; // not-found / error — the sheet never appeared
-    }
+  const pending = sendCommand(conn, req);
+  pending.then(() => { settled = true; }, () => { settled = true; });
+  const res = await macApproveWhile(() => settled);
+  if (res && res.status === 'ready') {
+    process.stderr.write('cdp: macOS auto-approve clicked Chrome\'s "Allow remote debugging?" — connecting…\n');
+  } else if (res && res.status === 'accessibility-required') {
+    process.stderr.write(`cdp: cannot auto-approve — ${res.detail}\n`);
   }
-  if (outcome instanceof Error) throw outcome;
-  return outcome;
+  return pending;
 }
 
 function sendCommand(conn, req, { close = true } = {}) {
@@ -3790,6 +3816,8 @@ export {
   classifyMacApprove,
   runMacApproveScript,
   macApproveOnce,
+  macApproveWhile,
+  MAC_APPROVE_TERMINAL,
 };
 
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;

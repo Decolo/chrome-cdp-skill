@@ -1,12 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import {
   MAC_APPROVE_SCRIPT,
+  MAC_APPROVE_TERMINAL,
   classifyMacApprove,
   macApproveScript,
   runMacApproveScript,
   macApproveOnce,
+  macApproveWhile,
 } from '../skills/chrome-cdp/scripts/cdp.mjs';
+
+const SRC = readFileSync(new URL('../skills/chrome-cdp/scripts/cdp.mjs', import.meta.url), 'utf8');
 
 // ---------------------------------------------------------------------------
 // macOS auto-approve of Chrome's "Allow remote debugging?" sheet
@@ -153,4 +158,50 @@ test('script clicks EVERY stacked sheet (no early exit)', () => {
   // either language would silently break localized Chrome.
   assert.ok(MAC_APPROVE_SCRIPT.includes('contains "remote debugging"'), 'English wording covered');
   assert.ok(MAC_APPROVE_SCRIPT.includes('contains "远程调试"'), 'Chinese wording covered');
+});
+
+// ---------------------------------------------------------------------------
+// The daemon must approve the sheet itself.
+//
+// The sheet is MODAL: while it is up, ALL of Chrome is blocked. It is drawn
+// per NEW WebSocket connection, so a dropped connection makes the daemon
+// redraw it on every backoff retry. The CLI only approves while one of its own
+// commands is in flight, and the user is not watching a browser they did not
+// touch — so a daemon that merely retried left a frozen Chrome behind each
+// time. That is the reported freeze.
+// ---------------------------------------------------------------------------
+
+test('MAC_APPROVE_TERMINAL: only statuses where another poll cannot help', () => {
+  for (const s of ['ready', 'unsupported', 'setup-required', 'accessibility-required']) {
+    assert.ok(MAC_APPROVE_TERMINAL.has(s), `${s} is terminal`);
+  }
+  for (const s of ['not-found', 'no-match', 'error']) {
+    assert.ok(!MAC_APPROVE_TERMINAL.has(s), `${s} keeps polling — the sheet may still draw`);
+  }
+});
+
+test('macApproveWhile: isDone short-circuits before any osascript runs', async () => {
+  assert.equal(await macApproveWhile(() => true), null,
+    'returns null without polling once the thing we waited for has settled');
+});
+
+test('daemon connectOnce approves the sheet (modal would otherwise freeze Chrome)', () => {
+  const start = SRC.indexOf('async function connectOnce()');
+  assert.ok(start > -1, 'connectOnce exists');
+  const body = SRC.slice(start, SRC.indexOf('\n  }\n', start));
+  assert.match(body, /macApproveWhile\(\(\) => usable, 'daemon'\)/,
+    'the daemon approves while its connect attempt is in flight');
+  assert.match(body, /usable = true/,
+    'and stops approving once the connection is usable');
+  assert.match(body, /macApproveWhile[\s\S]*\.catch\(/,
+    'the floating loop cannot take the daemon down as an unhandled rejection');
+});
+
+test('CLI and daemon share one approve loop', () => {
+  // Two copies of this loop is how the daemon half went missing in the first
+  // place: the CLI polled for a sheet the daemon had drawn and nobody clicked.
+  const cli = SRC.slice(SRC.indexOf('async function sendCommandWithMacApprove'));
+  assert.match(cli, /await macApproveWhile\(\(\) => settled\)/, 'CLI uses the shared loop');
+  assert.ok(!SRC.includes('macDone'),
+    'the dead macDone flag stays gone — it was never read, so the loop never stopped');
 });
